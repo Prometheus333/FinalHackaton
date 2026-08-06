@@ -574,12 +574,26 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="tickerTrack" class="ticker-track inline-flex gap-10 px-4 text-sm"></div>
   </div>
 
-  <!-- Main layout: fixed 2x2 quadrant grid, no page-level scroll -->
-  <main class="flex-1 min-h-0 grid grid-cols-2 grid-rows-2 gap-3 p-3 overflow-hidden">
+  <!-- Main layout: fixed grid, no page-level scroll.
+       Column 1 (2/6 width): Watchlist + Chat. Column 2 (4/6 width): Chart + News. -->
+  <main class="flex-1 min-h-0 grid grid-cols-[2fr_4fr] grid-rows-2 gap-3 p-3 overflow-hidden">
 
-    <!-- Quadrant 1: Watchlist -->
+    <!-- Watchlist (col 1, row 1) -->
     <section class="panel glow rounded-lg p-3 flex flex-col overflow-hidden min-h-0">
       <h2 class="text-xs uppercase tracking-widest text-orange-400 mb-2 shrink-0">Watchlist</h2>
+      <div class="relative mb-2 shrink-0">
+        <button id="watchlistSearchBtn" type="button"
+                class="absolute left-1.5 top-1/2 -translate-y-1/2 text-gray-500 hover:text-orange-400">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5">
+            <circle cx="11" cy="11" r="7"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+        </button>
+        <input id="watchlistSearch" type="text" placeholder="Search or add symbol..."
+               class="w-full bg-[#0a0e13] border border-[var(--border)] rounded pl-7 pr-2 py-1 text-xs
+                      focus:outline-none focus:border-orange-400" />
+      </div>
       <div id="symbolList" class="flex-1 overflow-y-auto space-y-1 min-h-0"></div>
       <div class="mt-2 pt-2 border-t border-[var(--border)] shrink-0">
         <h2 class="text-xs uppercase tracking-widest text-cyan-300 mb-1">Overlays</h2>
@@ -587,18 +601,7 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- Quadrant 2: AI Chat -->
-    <section class="panel glow-blue rounded-lg p-3 flex flex-col overflow-hidden min-h-0">
-      <h2 class="text-xs uppercase tracking-widest text-cyan-300 mb-2 shrink-0">AI Desk Assistant</h2>
-      <div id="chatMessages" class="flex-1 overflow-y-auto space-y-2 mb-2 pr-1 min-h-0"></div>
-      <form id="chatForm" class="flex gap-1 shrink-0">
-        <input id="chatInput" type="text" placeholder="Ask about AAPL, run a scenario..."
-               class="flex-1 bg-[#0a0e13] border border-[var(--border)] rounded px-2 py-1.5 text-sm focus:outline-none focus:border-cyan-400" />
-        <button class="bg-cyan-600 hover:bg-cyan-500 text-black text-xs font-bold px-3 rounded">SEND</button>
-      </form>
-    </section>
-
-    <!-- Quadrant 3: Chart -->
+    <!-- Chart (col 2, row 1) -->
     <section class="panel glow rounded-lg p-3 flex flex-col overflow-hidden min-h-0">
       <div class="flex items-center justify-between mb-2 shrink-0 flex-wrap gap-1">
         <div class="flex items-center gap-2">
@@ -623,7 +626,33 @@ INDEX_HTML = """<!DOCTYPE html>
       <div id="legend" class="mt-1 flex flex-wrap gap-3 text-xs text-gray-400 shrink-0"></div>
     </section>
 
-    <!-- Quadrant 4: News -->
+    <!-- AI Chat (col 1, row 2) -->
+    <section class="panel glow-blue rounded-lg p-3 flex flex-col overflow-hidden min-h-0">
+      <h2 class="text-xs uppercase tracking-widest text-cyan-300 mb-2 shrink-0">AI Desk Assistant</h2>
+      <div id="chatMessages" class="flex-1 overflow-y-auto space-y-2 mb-2 pr-1 min-h-0"></div>
+      <form id="chatForm" class="flex gap-1 shrink-0">
+        <input id="chatInput" type="text" placeholder="Ask about AAPL, run a scenario..."
+               class="flex-1 bg-[#0a0e13] border border-[var(--border)] rounded px-2 py-1.5 text-sm focus:outline-none focus:border-cyan-400" />
+        <button id="micBtn" type="button" title="Voice input"
+                class="bg-[#10161d] hover:bg-[#182029] border border-[var(--border)] text-cyan-300 px-2.5 rounded flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+            <line x1="12" y1="19" x2="12" y2="23"></line>
+            <line x1="8" y1="23" x2="16" y2="23"></line>
+          </svg>
+        </button>
+        <button type="submit" title="Send"
+                class="bg-cyan-600 hover:bg-cyan-500 text-black px-3 rounded flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4">
+            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path>
+          </svg>
+        </button>
+      </form>
+    </section>
+
+    <!-- News (col 2, row 2) -->
     <section class="panel-2 rounded-lg p-3 flex flex-col overflow-hidden min-h-0">
       <h2 class="text-xs uppercase tracking-widest text-orange-400 mb-2 shrink-0">News Feed</h2>
       <div id="newsList" class="flex-1 overflow-y-auto space-y-2 text-xs pr-1 min-h-0"></div>
@@ -767,6 +796,8 @@ function renderOverlayChips() {
 }
 
 // ---------- Watchlist / ticker ----------
+let watchlistSymbols = [...DEFAULT_SYMBOLS];
+
 function highlightWatchlist(symbol) {
   document.querySelectorAll('.watch-item').forEach(el => {
     el.classList.toggle('border-orange-400', el.dataset.symbol === symbol);
@@ -775,7 +806,7 @@ function highlightWatchlist(symbol) {
 }
 
 async function refreshQuotes() {
-  const res = await fetch(`/api/quotes?symbols=${DEFAULT_SYMBOLS.join(',')}`);
+  const res = await fetch(`/api/quotes?symbols=${watchlistSymbols.join(',')}`);
   const quotes = await res.json();
 
   const listEl = document.getElementById('symbolList');
@@ -789,11 +820,53 @@ async function refreshQuotes() {
     listEl.appendChild(row);
   });
   highlightWatchlist(activeSymbol);
+  filterWatchlist(document.getElementById('watchlistSearch').value);
 
   const track = document.getElementById('tickerTrack');
   const html = quotes.map(q => `<span class="text-gray-400">${q.symbol} <span class="text-cyan-300">${q.price.toFixed(2)}</span></span>`).join('');
   track.innerHTML = html + html; // duplicate for seamless scroll
 }
+
+// ---------- Watchlist search ----------
+function filterWatchlist(query) {
+  const q = query.trim().toUpperCase();
+  document.querySelectorAll('.watch-item').forEach(row => {
+    row.style.display = !q || row.dataset.symbol.includes(q) ? '' : 'none';
+  });
+}
+
+async function addToWatchlist(symbol) {
+  symbol = symbol.trim().toUpperCase();
+  if (!symbol) return;
+  if (!watchlistSymbols.includes(symbol)) {
+    watchlistSymbols.push(symbol);
+  }
+  await refreshQuotes();
+  loadSymbol(symbol);
+  document.getElementById('watchlistSearch').value = '';
+  filterWatchlist('');
+}
+
+document.getElementById('watchlistSearch').addEventListener('input', (e) => {
+  filterWatchlist(e.target.value);
+});
+document.getElementById('watchlistSearch').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    const val = e.target.value.trim().toUpperCase();
+    const visibleMatch = watchlistSymbols.includes(val);
+    if (visibleMatch) {
+      loadSymbol(val);
+    } else if (val) {
+      addToWatchlist(val); // not in watchlist yet -> search & add
+    }
+  }
+});
+document.getElementById('watchlistSearchBtn').addEventListener('click', () => {
+  const input = document.getElementById('watchlistSearch');
+  const val = input.value.trim().toUpperCase();
+  if (val && !watchlistSymbols.includes(val)) addToWatchlist(val);
+  else input.focus();
+});
 
 // ---------- News ----------
 async function refreshNews(symbol, keywords) {
@@ -854,6 +927,44 @@ function applyCommand(cmd) {
       break;
   }
 }
+
+// ---------- Voice input (mic button) ----------
+(function setupMic() {
+  const micBtn = document.getElementById('micBtn');
+  const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognitionImpl) {
+    micBtn.title = 'Voice input not supported in this browser';
+    micBtn.classList.add('opacity-40', 'cursor-not-allowed');
+    return;
+  }
+  const recognition = new SpeechRecognitionImpl();
+  recognition.lang = 'en-US';
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+  let listening = false;
+
+  recognition.onstart = () => {
+    listening = true;
+    micBtn.classList.add('text-red-400', 'border-red-500');
+  };
+  recognition.onend = () => {
+    listening = false;
+    micBtn.classList.remove('text-red-400', 'border-red-500');
+  };
+  recognition.onresult = (event) => {
+    const transcript = event.results[0][0].transcript;
+    document.getElementById('chatInput').value = transcript;
+  };
+  recognition.onerror = () => {
+    listening = false;
+    micBtn.classList.remove('text-red-400', 'border-red-500');
+  };
+
+  micBtn.addEventListener('click', () => {
+    if (listening) { recognition.stop(); return; }
+    recognition.start();
+  });
+})();
 
 document.getElementById('chatForm').addEventListener('submit', async (e) => {
   e.preventDefault();
