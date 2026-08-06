@@ -39,8 +39,8 @@ from flask import Flask, request, jsonify, Response
 # Configuration — set these via environment variables, no secrets hardcoded.
 # --------------------------------------------------------------------------
 
-ALPACA_KEY_ID = os.environ.get("ALPACA_KEY_ID", "")
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_KEY_ID = os.environ.get("ALPACA_KEY_ID", "PKPY3CCI55KW57KJEWB4UXK3TU")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "AasJVR9bV839DB4B8bW12kMggRvkD3Y4vkKB5HSZWTWu")
 ALPACA_DATA_URL = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets/v2")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -425,6 +425,229 @@ def _mock_ai_response(user_message, symbol, bars):
 
 
 # --------------------------------------------------------------------------
+# Multi-agent strategy advisor
+#   Data Agent        -> get_bars() / get_news() (already defined above)
+#   Backtest Agent     -> run_backtest()
+#   Risk Agent         -> compute_risk_metrics()
+#   Strategy Agent     -> generate_strategy_recommendation() (Claude-powered)
+# Orchestrated together in /api/strategy/advise.
+# --------------------------------------------------------------------------
+
+def run_backtest(bars, fast=10, slow=30, initial_capital=10000):
+    """Backtest Agent: simple SMA-crossover long/flat strategy over the given
+    bars. Returns an equity curve (strategy vs buy & hold), the trade log,
+    and summary performance metrics."""
+    closes = [b["close"] for b in bars]
+    times = [b["time"] for b in bars]
+    n = len(closes)
+    if n < slow + 2:
+        return None
+
+    def sma(i, period):
+        if i + 1 < period:
+            return None
+        return sum(closes[i + 1 - period:i + 1]) / period
+
+    cash = float(initial_capital)
+    position = 0.0
+    equity_curve = []
+    trades = []
+    buy_hold_shares = initial_capital / closes[0]
+    last_buy_price = None
+
+    for i in range(n):
+        f, s = sma(i, fast), sma(i, slow)
+        if f is not None and s is not None:
+            if f > s and position == 0:
+                position = cash / closes[i]
+                cash = 0.0
+                last_buy_price = closes[i]
+                trades.append({"time": times[i], "type": "buy", "price": round(closes[i], 2)})
+            elif f <= s and position > 0:
+                cash = position * closes[i]
+                pnl_pct = round((closes[i] / last_buy_price - 1) * 100, 2) if last_buy_price else None
+                trades.append({"time": times[i], "type": "sell", "price": round(closes[i], 2), "pnl_pct": pnl_pct})
+                position = 0.0
+        equity = cash + position * closes[i]
+        equity_curve.append({
+            "time": times[i],
+            "equity": round(equity, 2),
+            "buy_hold": round(buy_hold_shares * closes[i], 2),
+        })
+
+    final_equity = cash + position * closes[-1]
+    total_return_pct = (final_equity / initial_capital - 1) * 100
+    buy_hold_return_pct = (closes[-1] / closes[0] - 1) * 100
+
+    peak = equity_curve[0]["equity"]
+    max_dd = 0.0
+    for pt in equity_curve:
+        peak = max(peak, pt["equity"])
+        if peak:
+            max_dd = min(max_dd, (pt["equity"] - peak) / peak * 100)
+
+    sell_trades = [t for t in trades if t["type"] == "sell" and t.get("pnl_pct") is not None]
+    wins = [t for t in sell_trades if t["pnl_pct"] > 0]
+    win_rate = round(len(wins) / len(sell_trades) * 100, 1) if sell_trades else 0.0
+
+    daily_returns = []
+    for i in range(1, len(equity_curve)):
+        prev, cur = equity_curve[i - 1]["equity"], equity_curve[i]["equity"]
+        if prev:
+            daily_returns.append((cur - prev) / prev)
+    sharpe = 0.0
+    if len(daily_returns) > 1:
+        mean_r = sum(daily_returns) / len(daily_returns)
+        variance = sum((r - mean_r) ** 2 for r in daily_returns) / len(daily_returns)
+        stdev = variance ** 0.5
+        if stdev > 0:
+            sharpe = (mean_r / stdev) * (252 ** 0.5)
+
+    metrics = {
+        "total_return_pct": round(total_return_pct, 2),
+        "buy_hold_return_pct": round(buy_hold_return_pct, 2),
+        "max_drawdown_pct": round(max_dd, 2),
+        "win_rate_pct": win_rate,
+        "num_trades": len(sell_trades),
+        "sharpe_ratio": round(sharpe, 2),
+        "final_equity": round(final_equity, 2),
+    }
+    return {"equity_curve": equity_curve, "trades": trades, "metrics": metrics}
+
+
+def compute_risk_metrics(bars, benchmark_bars=None):
+    """Risk Agent: annualized volatility, max drawdown, Sharpe ratio, beta
+    vs a benchmark (SPY by default), and a composite 0-100 risk score."""
+    closes = [b["close"] for b in bars]
+    daily_returns = [
+        (closes[i] - closes[i - 1]) / closes[i - 1]
+        for i in range(1, len(closes)) if closes[i - 1]
+    ]
+    n = len(daily_returns)
+    mean_r = sum(daily_returns) / n if n else 0
+    variance = sum((r - mean_r) ** 2 for r in daily_returns) / n if n else 0
+    stdev = variance ** 0.5
+    volatility_pct = stdev * (252 ** 0.5) * 100
+    sharpe = (mean_r / stdev) * (252 ** 0.5) if stdev > 0 else 0.0
+
+    peak = closes[0] if closes else 0
+    max_dd = 0.0
+    for c in closes:
+        peak = max(peak, c)
+        if peak:
+            max_dd = min(max_dd, (c - peak) / peak * 100)
+
+    beta = None
+    if benchmark_bars:
+        bclose = [b["close"] for b in benchmark_bars]
+        breturns = [
+            (bclose[i] - bclose[i - 1]) / bclose[i - 1]
+            for i in range(1, len(bclose)) if bclose[i - 1]
+        ]
+        m = min(len(daily_returns), len(breturns))
+        if m > 5:
+            xs, ys = breturns[-m:], daily_returns[-m:]
+            mean_x, mean_y = sum(xs) / m, sum(ys) / m
+            cov = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(m)) / m
+            var_x = sum((x - mean_x) ** 2 for x in xs) / m
+            beta = round(cov / var_x, 2) if var_x else None
+
+    risk_score = min(100, round(volatility_pct * 1.2 + abs(max_dd) * 0.8))
+    risk_label = "Low" if risk_score < 30 else ("Medium" if risk_score < 60 else "High")
+
+    return {
+        "annualized_volatility_pct": round(volatility_pct, 2),
+        "max_drawdown_pct": round(max_dd, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "beta_vs_spy": beta,
+        "risk_score": risk_score,
+        "risk_label": risk_label,
+    }
+
+
+STRATEGY_SYSTEM_PROMPT = """You are the Strategy Recommendation Agent inside a multi-agent \
+algorithmic trading advisor. You receive backtest results and risk metrics for one symbol's \
+SMA-crossover strategy and must turn them into a short, concrete recommendation.
+
+Respond with STRICT JSON ONLY (no markdown fences, no prose outside the JSON):
+{
+  "recommendation": "<2-4 sentences, referencing the actual numbers you were given>",
+  "suggested_params": {"fast": <int>, "slow": <int>},
+  "confidence": "Low" | "Medium" | "High",
+  "action": "Increase position" | "Reduce position" | "Hold" | "Avoid"
+}
+
+Base suggested_params on what would plausibly improve the Sharpe ratio or reduce drawdown given
+the data provided — don't invent numbers disconnected from the input context.
+"""
+
+
+def _mock_strategy_recommendation(symbol, backtest, risk, fast, slow):
+    """Rule-based fallback for the Strategy Agent if Claude is unavailable."""
+    m = backtest["metrics"]
+    if m["max_drawdown_pct"] < -20 or risk["risk_label"] == "High":
+        action = "Reduce position"
+    elif m["total_return_pct"] > m["buy_hold_return_pct"] and risk["risk_label"] != "High":
+        action = "Increase position"
+    else:
+        action = "Hold"
+
+    suggested_fast = max(5, fast - 2) if m["sharpe_ratio"] < 0.5 else fast
+    suggested_slow = slow + 5 if m["max_drawdown_pct"] < -15 else slow
+
+    reco = (
+        f"SMA({fast}/{slow}) on {symbol} returned {m['total_return_pct']}% vs "
+        f"{m['buy_hold_return_pct']}% buy-and-hold across {m['num_trades']} trades "
+        f"({m['win_rate_pct']}% win rate). Risk profile is {risk['risk_label'].lower()} — "
+        f"{risk['annualized_volatility_pct']}% annualized volatility, "
+        f"{m['max_drawdown_pct']}% max drawdown, Sharpe {m['sharpe_ratio']}."
+    )
+    return {
+        "recommendation": reco,
+        "suggested_params": {"fast": suggested_fast, "slow": suggested_slow},
+        "confidence": "Medium",
+        "action": action,
+    }
+
+
+def generate_strategy_recommendation(symbol, backtest, risk, fast, slow):
+    """Strategy Agent: synthesizes backtest + risk output into a
+    recommendation via Claude, falling back to a rule-based version."""
+    if not ANTHROPIC_API_KEY:
+        result = _mock_strategy_recommendation(symbol, backtest, risk, fast, slow)
+        result["source"] = "fallback"
+        return result
+
+    context = {
+        "symbol": symbol,
+        "current_params": {"fast": fast, "slow": slow},
+        "backtest_metrics": backtest["metrics"],
+        "risk_metrics": risk,
+    }
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=400,
+            temperature=0.3,
+            system=STRATEGY_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": json.dumps(context)}],
+        )
+        raw = "".join(block.text for block in response.content if block.type == "text")
+        parsed = _extract_json(raw)
+        if parsed and "recommendation" in parsed:
+            parsed["source"] = "claude"
+            return parsed
+        raise ValueError("Claude response did not contain valid JSON")
+    except Exception as exc:
+        app.logger.warning(f"Strategy Agent Claude call failed, using fallback: {exc}")
+        result = _mock_strategy_recommendation(symbol, backtest, risk, fast, slow)
+        result["source"] = "fallback"
+        return result
+
+
+# --------------------------------------------------------------------------
 # Routes — API
 # --------------------------------------------------------------------------
 
@@ -472,6 +695,95 @@ def api_status():
     }
     cache_set("status_check", result)
     return jsonify(result)
+
+
+@app.route("/api/backtest", methods=["POST"])
+def api_backtest():
+    """Backtest Agent endpoint: SMA-crossover backtest for one symbol."""
+    data = request.get_json(force=True)
+    symbol = data.get("symbol", "AAPL").upper()
+    fast = int(data.get("fast", 10))
+    slow = int(data.get("slow", 30))
+    if fast >= slow:
+        return jsonify({"error": "The fast SMA period must be shorter than the slow SMA period."}), 400
+
+    bars, source = get_bars(symbol, limit=200)
+    result = run_backtest(bars, fast=fast, slow=slow)
+    if not result:
+        return jsonify({"error": f"Not enough historical bars ({len(bars)}) for a {slow}-day SMA backtest."}), 400
+    return jsonify({"symbol": symbol, "source": source, **result})
+
+
+@app.route("/api/risk/<symbol>")
+def api_risk(symbol):
+    """Risk Agent endpoint: volatility, drawdown, Sharpe, beta vs SPY."""
+    symbol = symbol.upper()
+    bars, source = get_bars(symbol, limit=120)
+    bench_bars = None
+    if symbol != "SPY":
+        bench_bars, _ = get_bars("SPY", limit=120)
+    result = compute_risk_metrics(bars, bench_bars)
+    return jsonify({"symbol": symbol, "source": source, **result})
+
+
+@app.route("/api/strategy/advise", methods=["POST"])
+def api_strategy_advise():
+    """Orchestrates all four agents end-to-end: Data -> Backtest -> Risk ->
+    Strategy, and returns a step-by-step agent_log alongside the results so
+    the UI can visibly show the multi-agent workflow running."""
+    data = request.get_json(force=True)
+    symbol = data.get("symbol", "AAPL").upper()
+    fast = int(data.get("fast", 10))
+    slow = int(data.get("slow", 30))
+    if fast >= slow:
+        return jsonify({"error": "The fast SMA period must be shorter than the slow SMA period."}), 400
+
+    agent_log = []
+
+    bars, source = get_bars(symbol, limit=200)
+    agent_log.append({
+        "agent": "Data Agent",
+        "message": f"Fetched {len(bars)} daily bars for {symbol} ({source} source).",
+    })
+
+    backtest = run_backtest(bars, fast=fast, slow=slow)
+    if not backtest:
+        agent_log.append({"agent": "Backtest Agent", "message": "Not enough historical data for this window."})
+        return jsonify({"symbol": symbol, "agent_log": agent_log, "error": "insufficient_data"}), 400
+    m = backtest["metrics"]
+    agent_log.append({
+        "agent": "Backtest Agent",
+        "message": (f"SMA({fast}/{slow}) crossover: {m['total_return_pct']}% return "
+                    f"vs {m['buy_hold_return_pct']}% buy-and-hold, {m['num_trades']} trades, "
+                    f"{m['win_rate_pct']}% win rate, Sharpe {m['sharpe_ratio']}."),
+    })
+
+    bench_bars = None
+    if symbol != "SPY":
+        bench_bars, _ = get_bars("SPY", limit=120)
+    risk = compute_risk_metrics(bars, bench_bars)
+    agent_log.append({
+        "agent": "Risk Agent",
+        "message": (f"Risk score {risk['risk_score']}/100 ({risk['risk_label']}) — "
+                    f"{risk['annualized_volatility_pct']}% annualized volatility, "
+                    f"{risk['max_drawdown_pct']}% max drawdown"
+                    + (f", beta {risk['beta_vs_spy']} vs SPY." if risk['beta_vs_spy'] is not None else ".")),
+    })
+
+    recommendation = generate_strategy_recommendation(symbol, backtest, risk, fast, slow)
+    agent_log.append({
+        "agent": "Strategy Agent",
+        "message": recommendation["recommendation"],
+        "source": recommendation.get("source", "fallback"),
+    })
+
+    return jsonify({
+        "symbol": symbol,
+        "agent_log": agent_log,
+        "backtest": backtest,
+        "risk": risk,
+        "recommendation": recommendation,
+    })
 
 
 @app.route("/api/whatif", methods=["POST"])
@@ -616,14 +928,51 @@ INDEX_HTML = """<!DOCTYPE html>
           <button id="clearOverlaysBtn" class="px-1.5 py-1 rounded border border-[var(--border)] hover:border-red-400 text-red-300">Clear</button>
         </div>
       </div>
-      <div class="flex gap-1 mb-2 shrink-0 overflow-x-auto text-xs">
-        <button class="scenario-btn panel-2 border border-[var(--border)] rounded px-2 py-1 whitespace-nowrap" data-type="rate_change" data-mag="0.5">Rates +0.5%</button>
-        <button class="scenario-btn panel-2 border border-[var(--border)] rounded px-2 py-1 whitespace-nowrap" data-type="rate_change" data-mag="-0.5">Rates −0.5%</button>
-        <button class="scenario-btn panel-2 border border-[var(--border)] rounded px-2 py-1 whitespace-nowrap" data-type="revenue_change" data-mag="-10">Revenue −10%</button>
-        <button class="scenario-btn panel-2 border border-[var(--border)] rounded px-2 py-1 whitespace-nowrap" data-type="revenue_change" data-mag="15">Revenue +15%</button>
+
+      <!-- View tabs: Price / Backtest / Risk -->
+      <div class="flex gap-1 mb-2 shrink-0 text-xs">
+        <button data-view="price" class="view-tab-btn px-2.5 py-1 rounded border border-orange-400 text-orange-300">Price Chart</button>
+        <button data-view="backtest" class="view-tab-btn px-2.5 py-1 rounded border border-[var(--border)] text-gray-400 hover:border-cyan-400">Backtest Agent</button>
+        <button data-view="risk" class="view-tab-btn px-2.5 py-1 rounded border border-[var(--border)] text-gray-400 hover:border-cyan-400">Risk Agent</button>
       </div>
-      <div id="chart" class="flex-1 min-h-0"></div>
-      <div id="legend" class="mt-1 flex flex-wrap gap-3 text-xs text-gray-400 shrink-0"></div>
+
+      <!-- Price view -->
+      <div id="viewPrice" class="flex-1 min-h-0 flex flex-col">
+        <div class="flex gap-1 mb-2 shrink-0 overflow-x-auto text-xs">
+          <button class="scenario-btn panel-2 border border-[var(--border)] rounded px-2 py-1 whitespace-nowrap" data-type="rate_change" data-mag="0.5">Rates +0.5%</button>
+          <button class="scenario-btn panel-2 border border-[var(--border)] rounded px-2 py-1 whitespace-nowrap" data-type="rate_change" data-mag="-0.5">Rates −0.5%</button>
+          <button class="scenario-btn panel-2 border border-[var(--border)] rounded px-2 py-1 whitespace-nowrap" data-type="revenue_change" data-mag="-10">Revenue −10%</button>
+          <button class="scenario-btn panel-2 border border-[var(--border)] rounded px-2 py-1 whitespace-nowrap" data-type="revenue_change" data-mag="15">Revenue +15%</button>
+        </div>
+        <div id="chart" class="flex-1 min-h-0"></div>
+        <div id="legend" class="mt-1 flex flex-wrap gap-3 text-xs text-gray-400 shrink-0"></div>
+      </div>
+
+      <!-- Backtest Agent view -->
+      <div id="viewBacktest" class="flex-1 min-h-0 flex-col hidden">
+        <div class="flex flex-wrap items-end gap-2 mb-2 shrink-0 text-xs">
+          <label class="flex flex-col gap-0.5 text-gray-400">Fast SMA
+            <input id="fastInput" type="number" value="10" min="2" max="100"
+                   class="w-16 bg-[#0a0e13] border border-[var(--border)] rounded px-1.5 py-1 text-gray-200" />
+          </label>
+          <label class="flex flex-col gap-0.5 text-gray-400">Slow SMA
+            <input id="slowInput" type="number" value="30" min="3" max="250"
+                   class="w-16 bg-[#0a0e13] border border-[var(--border)] rounded px-1.5 py-1 text-gray-200" />
+          </label>
+          <button id="runAdvisorBtn" class="bg-orange-600 hover:bg-orange-500 text-black font-bold px-3 py-1.5 rounded">
+            Run Multi-Agent Analysis
+          </button>
+          <span id="advisorSpinner" class="text-gray-500 hidden">Agents working…</span>
+        </div>
+        <div id="backtestChart" class="flex-1 min-h-0"></div>
+        <div id="backtestMetrics" class="mt-1 grid grid-cols-3 gap-1 text-[10px] shrink-0"></div>
+      </div>
+
+      <!-- Risk Agent view -->
+      <div id="viewRisk" class="flex-1 min-h-0 overflow-y-auto hidden">
+        <div id="riskMetrics" class="grid grid-cols-2 gap-2 text-xs"></div>
+        <div id="riskEmpty" class="text-gray-500 text-xs mt-2">Run the multi-agent analysis from the Backtest Agent tab to populate risk metrics.</div>
+      </div>
     </section>
 
     <!-- AI Chat (col 1, row 2) -->
@@ -709,6 +1058,82 @@ function initChart() {
     borderVisible: false,
     wickUpColor: '#22c55e', wickDownColor: '#ef4444',
   });
+}
+
+// ---------- View tabs (Price / Backtest / Risk) ----------
+let backtestChart, backtestStrategySeries, backtestBuyHoldSeries;
+
+function initBacktestChart() {
+  if (backtestChart) return;
+  const el = document.getElementById('backtestChart');
+  backtestChart = LightweightCharts.createChart(el, {
+    layout: { background: { color: 'transparent' }, textColor: '#9fb3c8' },
+    grid: { vertLines: { color: '#131b24' }, horzLines: { color: '#131b24' } },
+    rightPriceScale: { borderColor: '#1c2733' },
+    timeScale: { borderColor: '#1c2733' },
+    autoSize: true,
+  });
+  backtestStrategySeries = backtestChart.addLineSeries({ color: '#33c9ff', lineWidth: 2, title: 'Strategy' });
+  backtestBuyHoldSeries = backtestChart.addLineSeries({ color: '#facc15', lineWidth: 1.5, title: 'Buy & Hold' });
+}
+
+document.querySelectorAll('.view-tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const view = btn.dataset.view;
+    ['price', 'backtest', 'risk'].forEach(v => {
+      document.getElementById('view' + v[0].toUpperCase() + v.slice(1)).classList.toggle('hidden', v !== view);
+    });
+    document.querySelectorAll('.view-tab-btn').forEach(b => {
+      const active = b === btn;
+      b.classList.toggle('border-orange-400', active);
+      b.classList.toggle('text-orange-300', active);
+      b.classList.toggle('border-[var(--border)]', !active);
+      b.classList.toggle('text-gray-400', !active);
+    });
+    if (view === 'backtest') {
+      initBacktestChart();
+      setTimeout(() => backtestChart && backtestChart.timeScale().fitContent(), 50);
+    }
+    if (view === 'price') {
+      setTimeout(() => chart && chart.timeScale().fitContent(), 50);
+    }
+  });
+});
+
+function metricCard(label, value, colorClass) {
+  return `<div class="panel-2 border border-[var(--border)] rounded px-2 py-1.5">
+            <div class="text-gray-500">${label}</div>
+            <div class="font-semibold ${colorClass || 'text-gray-200'}">${value}</div>
+          </div>`;
+}
+
+function renderBacktestResult(data) {
+  initBacktestChart();
+  backtestStrategySeries.setData(data.equity_curve.map(p => ({ time: p.time, value: p.equity })));
+  backtestBuyHoldSeries.setData(data.equity_curve.map(p => ({ time: p.time, value: p.buy_hold })));
+  backtestChart.timeScale().fitContent();
+
+  const m = data.metrics;
+  const box = document.getElementById('backtestMetrics');
+  box.innerHTML =
+    metricCard('Strategy Return', `${m.total_return_pct >= 0 ? '+' : ''}${m.total_return_pct}%`, m.total_return_pct >= 0 ? 'text-green-400' : 'text-red-400') +
+    metricCard('Buy & Hold', `${m.buy_hold_return_pct >= 0 ? '+' : ''}${m.buy_hold_return_pct}%`, 'text-yellow-400') +
+    metricCard('Max Drawdown', `${m.max_drawdown_pct}%`, 'text-red-400') +
+    metricCard('Win Rate', `${m.win_rate_pct}%`) +
+    metricCard('Trades', m.num_trades) +
+    metricCard('Sharpe', m.sharpe_ratio);
+}
+
+function renderRiskResult(risk) {
+  document.getElementById('riskEmpty').classList.add('hidden');
+  const badgeColor = risk.risk_label === 'Low' ? 'text-green-400' : (risk.risk_label === 'Medium' ? 'text-yellow-400' : 'text-red-400');
+  const box = document.getElementById('riskMetrics');
+  box.innerHTML =
+    metricCard('Risk Score', `${risk.risk_score}/100 (${risk.risk_label})`, badgeColor) +
+    metricCard('Ann. Volatility', `${risk.annualized_volatility_pct}%`) +
+    metricCard('Max Drawdown', `${risk.max_drawdown_pct}%`, 'text-red-400') +
+    metricCard('Sharpe Ratio', risk.sharpe_ratio) +
+    metricCard('Beta vs SPY', risk.beta_vs_spy ?? '—');
 }
 
 async function loadSymbol(symbol, timeframe="1Day") {
@@ -1014,6 +1439,68 @@ document.getElementById('clearOverlaysBtn').addEventListener('click', clearExtra
 
 document.querySelectorAll('.tf-btn').forEach(btn => {
   btn.addEventListener('click', () => loadSymbol(activeSymbol, btn.dataset.tf));
+});
+
+// ---------- Multi-agent Strategy Advisor ----------
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+const AGENT_ICON = {
+  'Data Agent': '📡',
+  'Backtest Agent': '🧪',
+  'Risk Agent': '⚠️',
+  'Strategy Agent': '🧠',
+};
+
+document.getElementById('runAdvisorBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('runAdvisorBtn');
+  const spinner = document.getElementById('advisorSpinner');
+  const fast = parseInt(document.getElementById('fastInput').value, 10);
+  const slow = parseInt(document.getElementById('slowInput').value, 10);
+
+  if (!(fast > 0) || !(slow > 0) || fast >= slow) {
+    appendChatMessage('ai', 'The fast SMA period must be a positive number smaller than the slow SMA period.');
+    return;
+  }
+
+  btn.disabled = true;
+  spinner.classList.remove('hidden');
+  appendChatMessage('ai', `Kicking off the multi-agent workflow for ${activeSymbol} — SMA(${fast}/${slow})...`);
+
+  try {
+    const res = await fetch('/api/strategy/advise', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ symbol: activeSymbol, fast, slow })
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      appendChatMessage('ai', data.error || 'The advisor agents could not complete this run.');
+      return;
+    }
+
+    // Reveal each agent's step one at a time for a visible orchestration trail.
+    for (const step of data.agent_log) {
+      await sleep(500);
+      const icon = AGENT_ICON[step.agent] || '🤖';
+      appendChatMessage('ai', `${icon} ${step.agent}: ${step.message}`, step.source);
+    }
+
+    renderBacktestResult(data.backtest);
+    renderRiskResult(data.risk);
+
+    // Suggest the parameter adjustment as a scenario overlay on the price chart too.
+    if (data.recommendation && data.recommendation.suggested_params) {
+      const sp = data.recommendation.suggested_params;
+      appendChatMessage('ai', `Suggested action: ${data.recommendation.action} (confidence: ${data.recommendation.confidence}). Suggested params: SMA(${sp.fast}/${sp.slow}).`);
+    }
+
+    document.querySelector('.view-tab-btn[data-view="backtest"]').click();
+  } catch (err) {
+    appendChatMessage('ai', 'Connection error while running the multi-agent analysis — check server logs.');
+  } finally {
+    btn.disabled = false;
+    spinner.classList.add('hidden');
+  }
 });
 
 // ---------- Boot ----------
