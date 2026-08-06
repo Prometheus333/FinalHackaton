@@ -1,4 +1,4 @@
 flask
 requests
 feedparser
-openai
+anthropic
