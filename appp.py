@@ -1,6 +1,11 @@
 """
 AI Trading Terminal — single-file Flask app for the hackathon.
 
+Arquitectura multi-agente (A2A):
+    Portfolio Manager (agente principal)
+      ├── data_analyst_agent      -> precios, noticias, técnicos
+      └── cro_risk_agent          -> backtesting, riesgo, niveles
+
 Run:
     pip install -r requirements.txt
     python app.py
@@ -11,6 +16,7 @@ import os
 import re
 import json
 import time
+import uuid
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -18,14 +24,14 @@ import requests
 import feedparser
 from flask import Flask, request, jsonify, Response
 
-# LangChain y herramientas
+# LangChain y herramientas (LangChain v1 + langchain-classic)
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain.globals import set_llm_cache
-from langchain_community.cache import InMemoryCache
+from langchain_core.caches import InMemoryCache
+from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
+
 import urllib3
 import warnings
 
@@ -45,14 +51,17 @@ requests.Session.request = patched_request
 client_llm = requests.Session()
 client_llm.verify = False
 
-ALPACA_KEY_ID = os.environ.get("ALPACA_KEY_ID", "PKPY3CCI55KW57KJEWB4UXK3TU")
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "AasJVR9bV839DB4B8bW12kMggRvkD3Y4vkKB5HSZWTWu")
+ALPACA_KEY_ID = os.environ.get("ALPACA_KEY_ID", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_DATA_URL = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets/v2")
 ALPACA_TRADING_URL = os.environ.get("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets/v2")
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://genailab.tcs.in")
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "sk-taPdt4_aNdzmFCX3nP0GiA")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "azure/genailab-maas-gpt-4.1")
+
+# Guardrail: órdenes por encima de este tamaño requieren aprobación humana (HITL)
+HITL_QTY_THRESHOLD = int(os.environ.get("HITL_QTY_THRESHOLD", "5"))
 
 app = Flask(__name__)
 
@@ -63,13 +72,13 @@ CACHE_TTL_SECONDS = 30
 def cache_get(key):
     with _cache_lock:
         entry = _cache.get(key)
-        if entry and (time.time() - entry["t"]) < CACHE_TTL_SECONDS:
+        if entry and (time.time() - entry["t"]) < entry["ttl"]:
             return entry["v"]
     return None
 
 def cache_set(key, value, ttl_override=None):
     with _cache_lock:
-        _cache[key] = {"t": time.time() if not ttl_override else time.time() + ttl_override, "v": value}
+        _cache[key] = {"t": time.time(), "ttl": ttl_override or CACHE_TTL_SECONDS, "v": value}
 
 def alpaca_headers():
     return {
@@ -225,22 +234,22 @@ def get_bars(symbol, timeframe="1Day", limit=250):
 
     interval = "1d" if timeframe == "1Day" else "1wk"
     rng = "1y" if timeframe == "1Day" else "2y"
-    
+
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={rng}"
     headers = {"User-Agent": "Mozilla/5.0"}
-    
+
     try:
         r = requests.get(url, headers=headers, timeout=10)
         r.raise_for_status()
         data = r.json()
-        
+
         if not data.get("chart", {}).get("result"): return []
-            
+
         result = data["chart"]["result"][0]
         timestamps = result.get("timestamp", [])
         quote = result["indicators"]["quote"][0]
         opens, highs, lows, closes, volumes = quote.get("open", []), quote.get("high", []), quote.get("low", []), quote.get("close", []), quote.get("volume", [])
-        
+
         raw_bars = []
         for i in range(len(timestamps)):
             if closes[i] is not None:
@@ -249,7 +258,7 @@ def get_bars(symbol, timeframe="1Day", limit=250):
                     "time": dt.strftime("%Y-%m-%d"), "open": round(opens[i], 2), "high": round(highs[i], 2),
                     "low": round(lows[i], 2), "close": round(closes[i], 2), "volume": volumes[i]
                 })
-        
+
         bars = raw_bars[-limit:]
         closes_list = [b["close"] for b in bars]
         ema20 = _ema_list(closes_list, 20)
@@ -288,7 +297,7 @@ def get_news(symbol=None, limit=8):
             })
     except Exception:
         pass
-        
+
     if items:
         try:
             headlines_text = "\n".join([f"[{i}] {item['title']}" for i, item in enumerate(items)])
@@ -297,21 +306,190 @@ def get_news(symbol=None, limit=8):
             cleaned = re.sub(r'^```(json)?', '', res.content.strip()).replace('```', '')
             sentiment_map = json.loads(cleaned)
             for i, item in enumerate(items): item["sentiment"] = sentiment_map.get(str(i), "NEUTRAL").upper()
-        except Exception as e:
+        except Exception:
             pass
 
     cache_set(cache_key, items, ttl_override=120)
     return items
 
 # --------------------------------------------------------------------------
-# Multi-Agent AI Logic & LangChain Tools
+# BACKTESTING ENGINE — cruce de medias móviles sobre las últimas N velas
+# --------------------------------------------------------------------------
+def run_backtest(symbol, timeframe="1Day", fast=10, slow=30, lookback=60):
+    """
+    Simula una estrategia long-only de cruce de medias móviles (SMA fast x SMA slow)
+    sobre las últimas `lookback` velas y devuelve el PnL teórico.
+
+    Reglas:
+      - Cruce alcista (fast cruza por encima de slow) -> abrir posición larga
+      - Cruce bajista (fast cruza por debajo de slow) -> cerrar posición
+      - Posición abierta al final -> se valúa a precio de cierre (mark-to-market)
+    """
+    cache_key = f"backtest:{symbol}:{timeframe}:{fast}:{slow}:{lookback}"
+    cached = cache_get(cache_key)
+    if cached: return cached
+
+    bars = get_bars(symbol, timeframe=timeframe, limit=lookback + slow + 10)
+    if len(bars) < slow + 10:
+        return {"symbol": symbol, "error": "Historial insuficiente para correr el backtest."}
+
+    closes = [b["close"] for b in bars]
+    sma_f = _sma_list(closes, fast)
+    sma_s = _sma_list(closes, slow)
+
+    start = max(slow, len(closes) - lookback)
+    position = 0
+    entry_price = 0.0
+    entry_time = None
+    trades = []
+
+    for i in range(start, len(closes)):
+        if None in (sma_f[i], sma_s[i], sma_f[i - 1], sma_s[i - 1]):
+            continue
+        cross_up = sma_f[i - 1] <= sma_s[i - 1] and sma_f[i] > sma_s[i]
+        cross_down = sma_f[i - 1] >= sma_s[i - 1] and sma_f[i] < sma_s[i]
+
+        if cross_up and position == 0:
+            position = 1
+            entry_price = closes[i]
+            entry_time = bars[i]["time"]
+        elif cross_down and position == 1:
+            pnl = closes[i] - entry_price
+            trades.append({
+                "entry_time": entry_time, "entry": round(entry_price, 2),
+                "exit_time": bars[i]["time"], "exit": round(closes[i], 2),
+                "pnl": round(pnl, 2), "pnl_pct": round(pnl / entry_price * 100, 2),
+                "status": "CLOSED",
+            })
+            position = 0
+
+    open_trade = None
+    if position == 1:
+        pnl = closes[-1] - entry_price
+        open_trade = {
+            "entry_time": entry_time, "entry": round(entry_price, 2),
+            "exit_time": bars[-1]["time"], "exit": round(closes[-1], 2),
+            "pnl": round(pnl, 2), "pnl_pct": round(pnl / entry_price * 100, 2),
+            "status": "OPEN (mark-to-market)",
+        }
+        trades.append(open_trade)
+
+    total_pnl = round(sum(t["pnl"] for t in trades), 2)
+    wins = [t for t in trades if t["pnl"] > 0]
+    win_rate = round(len(wins) / len(trades) * 100, 1) if trades else 0.0
+    capital_base = closes[start] if closes[start] else closes[-1]
+    total_pnl_pct = round(total_pnl / capital_base * 100, 2) if capital_base else 0.0
+    buy_hold_pct = round((closes[-1] - closes[start]) / capital_base * 100, 2) if capital_base else 0.0
+
+    data = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "strategy": f"SMA {fast} x SMA {slow} (long-only)",
+        "periods_tested": len(closes) - start,
+        "num_trades": len(trades),
+        "win_rate_pct": win_rate,
+        "total_pnl": total_pnl,
+        "total_pnl_pct": total_pnl_pct,
+        "buy_and_hold_pct": buy_hold_pct,
+        "beats_buy_and_hold": total_pnl_pct > buy_hold_pct,
+        "best_trade": max((t["pnl"] for t in trades), default=0.0),
+        "worst_trade": min((t["pnl"] for t in trades), default=0.0),
+        "open_position": open_trade is not None,
+        "trades": trades[-6:],
+    }
+    cache_set(cache_key, data, ttl_override=300)
+    return data
+
+def _backtest_summary_text(bt):
+    """Resumen compacto del backtest para que el LLM lo consuma sin gastar contexto de más."""
+    if bt.get("error"):
+        return f"Backtest de {bt.get('symbol')}: {bt['error']}"
+    veredicto = "SUPERA" if bt["beats_buy_and_hold"] else "NO supera"
+    return (
+        f"BACKTEST {bt['symbol']} | Estrategia: {bt['strategy']} | "
+        f"Periodos: {bt['periods_tested']} | Operaciones: {bt['num_trades']} | "
+        f"Win rate: {bt['win_rate_pct']}% | PnL teorico: ${bt['total_pnl']} ({bt['total_pnl_pct']}%) | "
+        f"Buy & hold: {bt['buy_and_hold_pct']}% | La estrategia {veredicto} a buy & hold. "
+        f"Mejor operacion: ${bt['best_trade']} | Peor operacion: ${bt['worst_trade']}."
+    )
+
+# --------------------------------------------------------------------------
+# TRACEABILITY — registro del chain of thought entre agentes
+# --------------------------------------------------------------------------
+_trace_ctx = threading.local()
+
+def trace_reset():
+    _trace_ctx.steps = []
+    _trace_ctx.pending = None
+
+def trace_add(level, agent, tool_name, tool_input="", output=""):
+    if not hasattr(_trace_ctx, "steps"):
+        _trace_ctx.steps = []
+    _trace_ctx.steps.append({
+        "level": level,
+        "agent": agent,
+        "tool": tool_name,
+        "input": str(tool_input)[:400],
+        "output": str(output)[:700],
+        "ts": datetime.now().strftime("%H:%M:%S"),
+    })
+
+def trace_get():
+    return getattr(_trace_ctx, "steps", [])
+
+def trace_set_pending(payload):
+    _trace_ctx.pending = payload
+
+def trace_get_pending():
+    return getattr(_trace_ctx, "pending", None)
+
+def _absorb_subagent_steps(agent_name, result):
+    """Vuelca los pasos internos de un sub-agente al trace global."""
+    for action, observation in result.get("intermediate_steps", []):
+        trace_add(1, agent_name, getattr(action, "tool", "?"), getattr(action, "tool_input", ""), observation)
+    trace_add(1, agent_name, "final_answer", "", result.get("output", ""))
+
+# --------------------------------------------------------------------------
+# HUMAN-IN-THE-LOOP — cola de órdenes que requieren aprobación
+# --------------------------------------------------------------------------
+pending_trades = {}
+_pending_lock = threading.Lock()
+
+def _place_order(symbol, side, qty):
+    """Manda la orden real a Alpaca. Devuelve (ok, payload_o_mensaje)."""
+    payload = {
+        "symbol": symbol.upper(), "qty": qty, "side": side.lower(),
+        "type": "market", "time_in_force": "day",
+    }
+    try:
+        r = requests.post(f"{ALPACA_TRADING_URL}/orders", headers=alpaca_headers(), json=payload, timeout=8)
+        if r.status_code in (200, 201):
+            return True, r.json()
+        try:
+            return False, r.json().get("message", r.text)
+        except Exception:
+            return False, r.text
+    except Exception as e:
+        return False, str(e)
+
+# --------------------------------------------------------------------------
+# LLM
 # --------------------------------------------------------------------------
 import httpx
 client_httpx = httpx.Client(verify=False)
 
-llm = ChatOpenAI(base_url=LLM_BASE_URL, model=LLM_MODEL, api_key=LLM_API_KEY, http_client=client_httpx, temperature=0.2)
-set_llm_cache(InMemoryCache())
+llm = ChatOpenAI(
+    base_url=LLM_BASE_URL,
+    model=LLM_MODEL,
+    api_key=LLM_API_KEY,
+    http_client=client_httpx,
+    temperature=0.2,
+    cache=InMemoryCache(),
+)
 
+# --------------------------------------------------------------------------
+# NIVEL 1 — Herramientas del DATA ANALYST
+# --------------------------------------------------------------------------
 @tool
 def get_price_tool(symbol: str) -> str:
     """Returns the latest stock price and short historical context for a given symbol."""
@@ -322,60 +500,227 @@ def get_price_tool(symbol: str) -> str:
 
 @tool
 def get_news_tool(symbol: str) -> str:
-    """Returns the latest financial news headlines for a given stock symbol."""
+    """Returns the latest financial news headlines and their sentiment for a given stock symbol."""
     news = get_news(symbol.upper(), limit=3)
     if not news: return f"No recent news found for {symbol}."
     return "\n".join([f"- {n['title']} (Sentiment: {n['sentiment']}) : {n['summary']}" for n in news])
 
 @tool
+def get_technicals_tool(symbol: str) -> str:
+    """Returns the current technical picture: last close, SMA20, SMA50, RSI14, support and resistance."""
+    bars = get_bars(symbol.upper(), limit=120)
+    if not bars: return f"No market data available for {symbol}."
+    ind = compute_indicators(bars)
+    lv = compute_levels(bars)
+    def last(series):
+        return series[-1]["value"] if series else "n/a"
+    return (
+        f"{symbol.upper()} | Close: {bars[-1]['close']} | SMA20: {last(ind.get('sma20', []))} | "
+        f"SMA50: {last(ind.get('sma50', []))} | RSI14: {last(ind.get('rsi14', []))} | "
+        f"Support: {lv.get('support')} | Resistance: {lv.get('resistance')}"
+    )
+
+analyst_tools = [get_price_tool, get_news_tool, get_technicals_tool]
+
+# --------------------------------------------------------------------------
+# NIVEL 1 — Herramientas del CRO (RIESGO)
+# --------------------------------------------------------------------------
+@tool
+def run_backtest_tool(symbol: str) -> str:
+    """Runs a historical backtest of an SMA-crossover strategy over the last 60 candles and returns the theoretical PnL, win rate and comparison against buy & hold."""
+    return _backtest_summary_text(run_backtest(symbol.upper()))
+
+@tool
+def get_risk_levels_tool(symbol: str) -> str:
+    """Returns the proposed entry price, stop-loss, take-profit and risk/reward ratio for a symbol."""
+    s = generate_strategy(symbol.upper())
+    if s.get("error"): return f"{symbol}: {s['error']}"
+    return (
+        f"{symbol.upper()} | Signal: {s['signal']} | Entry: {s['entry']} | "
+        f"Stop-loss: {s['stop_loss']} | Take-profit: {s['take_profit']} | R:R {s['risk_reward']} | "
+        f"Rationale: {s['rationale']}"
+    )
+
+@tool
 def get_ai_recommendation_tool(symbol: str) -> str:
-    """Runs a Chief Risk Officer and Head Trader analysis to provide a BUY/SELL/HOLD recommendation."""
+    """Returns the algorithmic momentum signal (BUY/SELL/HOLD) with its confidence and rationale."""
     rec = generate_ai_recommendation(symbol.upper())
     return f"AI Recommendation for {symbol}: SIGNAL={rec['signal']}, Confidence={rec['confidence']}. Rationale: {rec['rationale']}"
+
+cro_tools = [run_backtest_tool, get_risk_levels_tool, get_ai_recommendation_tool]
+
+# --------------------------------------------------------------------------
+# SUB-AGENTES
+# --------------------------------------------------------------------------
+analyst_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are the DATA ANALYST agent of a trading desk. Your job is to gather and summarise FACTS: "
+     "prices, news sentiment and technical indicators. Use your tools to get real data — never invent numbers. "
+     "You do NOT give buy/sell advice and you do NOT execute trades. "
+     "Reply with a dense, factual briefing of at most 6 lines."),
+    ("user", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+cro_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are the CHIEF RISK OFFICER (CRO) agent of a trading desk. Your job is to assess RISK. "
+     "You must ALWAYS run the backtest tool before giving a verdict — historical evidence is mandatory. "
+     "Then check the risk levels (entry, stop-loss, take-profit, R:R) and the momentum signal. "
+     "End with an explicit verdict line: 'RISK VERDICT: APPROVE' or 'RISK VERDICT: REJECT', plus the "
+     "theoretical PnL from the backtest and the stop-loss you require. Maximum 7 lines."),
+    ("user", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+data_analyst_agent = create_tool_calling_agent(llm, analyst_tools, analyst_prompt)
+data_analyst_executor = AgentExecutor(
+    agent=data_analyst_agent, tools=analyst_tools,
+    verbose=True, return_intermediate_steps=True, max_iterations=6,
+)
+
+cro_risk_agent = create_tool_calling_agent(llm, cro_tools, cro_prompt)
+cro_risk_executor = AgentExecutor(
+    agent=cro_risk_agent, tools=cro_tools,
+    verbose=True, return_intermediate_steps=True, max_iterations=6,
+)
+
+# --------------------------------------------------------------------------
+# NIVEL 0 — Herramientas del PORTFOLIO MANAGER (delegación A2A + ejecución)
+# --------------------------------------------------------------------------
+@tool
+def delegate_to_data_analyst(request: str) -> str:
+    """
+    Delegates a research question to the Data Analyst sub-agent.
+    Use it to obtain prices, news sentiment or technical indicators for one or more symbols.
+    Pass a full natural-language request, e.g. 'Give me the price, news sentiment and technicals for AAPL'.
+    """
+    trace_add(0, "portfolio_manager", "delegate_to_data_analyst", request, "→ delegando...")
+    try:
+        res = data_analyst_executor.invoke({"input": request})
+        _absorb_subagent_steps("data_analyst_agent", res)
+        return f"[DATA ANALYST REPORT]\n{res['output']}"
+    except Exception as e:
+        trace_add(1, "data_analyst_agent", "error", request, str(e))
+        return f"[DATA ANALYST ERROR] {e}"
+
+@tool
+def delegate_to_cro(symbol: str) -> str:
+    """
+    Delegates a risk assessment to the Chief Risk Officer sub-agent for a single symbol.
+    The CRO will run a historical backtest, compute stop-loss / take-profit levels and return an
+    explicit APPROVE or REJECT verdict. ALWAYS call this before executing any trade.
+    """
+    trace_add(0, "portfolio_manager", "delegate_to_cro", symbol, "→ delegando...")
+    try:
+        res = cro_risk_executor.invoke({
+            "input": f"Assess the risk of taking a position in {symbol.upper()} right now. "
+                     f"Run the backtest first, then the risk levels, then give your verdict."
+        })
+        _absorb_subagent_steps("cro_risk_agent", res)
+        return f"[CRO RISK ASSESSMENT]\n{res['output']}"
+    except Exception as e:
+        trace_add(1, "cro_risk_agent", "error", symbol, str(e))
+        return f"[CRO ERROR] {e}"
 
 @tool
 def execute_trade_tool(symbol: str, side: str, qty: int = 1) -> str:
     """
-    Executes a real market order (Paper Trading) to buy or sell a stock.
-    Side MUST be 'buy' or 'sell'. Automatically checks for buying power.
+    Executes a market order (Paper Trading) to buy or sell a stock.
+    Side MUST be 'buy' or 'sell'. Only call this AFTER the CRO has approved the risk.
+    Orders above the desk's auto-execution limit are queued for human approval instead of being sent.
     """
-    try:
-        payload = {"symbol": symbol.upper(), "qty": qty, "side": side.lower(), "type": "market", "time_in_force": "day"}
-        r = requests.post(f"{ALPACA_TRADING_URL}/orders", headers=alpaca_headers(), json=payload, timeout=5)
-        if r.status_code in [200, 201]: return f"✅ SUCCESS: Executed {side.upper()} order for {qty} shares of {symbol}."
-        else: return f"❌ FAILED to execute trade: {r.text}"
-    except Exception as e: return f"❌ ERROR executing trade: {str(e)}"
+    symbol = symbol.upper()
+    side = side.lower()
 
-herramientas = [get_price_tool, get_news_tool, get_ai_recommendation_tool, execute_trade_tool]
+    if side not in ("buy", "sell"):
+        trace_add(0, "portfolio_manager", "execute_trade_tool", f"{side} {qty} {symbol}", "rechazado: side inválido")
+        return "❌ Invalid side. It must be 'buy' or 'sell'."
+
+    try:
+        qty = int(qty)
+    except Exception:
+        return "❌ Invalid qty. It must be an integer."
+
+    # ---------------- GUARDRAIL / HUMAN-IN-THE-LOOP ----------------
+    if qty > HITL_QTY_THRESHOLD:
+        tid = uuid.uuid4().hex[:8]
+        record = {
+            "id": tid, "symbol": symbol, "side": side, "qty": qty,
+            "status": "pending", "created": datetime.now().strftime("%H:%M:%S"),
+        }
+        with _pending_lock:
+            pending_trades[tid] = record
+        trace_set_pending(record)
+        trace_add(0, "portfolio_manager", "execute_trade_tool [GUARDRAIL]", f"{side} {qty} {symbol}",
+                  f"BLOQUEADO — excede el límite de {HITL_QTY_THRESHOLD}. Encolado como {tid} para aprobación humana.")
+        return (
+            f"⛔ GUARDRAIL TRIGGERED: an order for {qty} shares of {symbol} exceeds the desk's "
+            f"auto-execution limit of {HITL_QTY_THRESHOLD} shares. The order was NOT sent. "
+            f"It is queued as ticket {tid} and is AWAITING HUMAN APPROVAL. "
+            f"Do NOT retry and do NOT split the order into smaller ones. "
+            f"Tell the user the order is on hold and that they must approve or reject it using the buttons below."
+        )
+
+    ok, payload = _place_order(symbol, side, qty)
+    if ok:
+        trace_add(0, "portfolio_manager", "execute_trade_tool", f"{side} {qty} {symbol}", "orden enviada a Alpaca")
+        return f"✅ SUCCESS: Executed {side.upper()} order for {qty} shares of {symbol}."
+    trace_add(0, "portfolio_manager", "execute_trade_tool", f"{side} {qty} {symbol}", f"rechazada: {payload}")
+    return f"❌ FAILED to execute trade: {payload}"
+
+pm_tools = [delegate_to_data_analyst, delegate_to_cro, execute_trade_tool]
 chat_memory = []
 
+# --------------------------------------------------------------------------
+# AGENTE PRINCIPAL — PORTFOLIO MANAGER
+# --------------------------------------------------------------------------
 prompt_chat = ChatPromptTemplate.from_messages([
-    ("system", "You are an elite Autonomous AI Trading Agent. You have access to real-time prices, news, AI risk analysis, and the ABILITY TO EXECUTE TRADES (Paper Trading) on behalf of the user using the execute_trade_tool. If the user asks you to predict/evaluate and buy/sell based on conditions, DO IT autonomously using the tools. Keep responses professional and concise."),
+    ("system",
+     "You are the PORTFOLIO MANAGER of an autonomous AI trading desk. You do NOT gather data yourself and "
+     "you do NOT assess risk yourself — you COORDINATE two specialist sub-agents:\n"
+     "  • delegate_to_data_analyst — facts: prices, news sentiment, technical indicators.\n"
+     "  • delegate_to_cro — risk: historical backtest, stop-loss/take-profit levels, APPROVE/REJECT verdict.\n\n"
+     "MANDATORY WORKFLOW for any trading decision:\n"
+     "  1. Delegate the research to the Data Analyst.\n"
+     "  2. Delegate the risk assessment to the CRO. Never skip this step.\n"
+     "  3. Only if the CRO returns APPROVE may you call execute_trade_tool.\n"
+     "  4. If the CRO returns REJECT, do not trade and explain why to the user.\n\n"
+     f"Orders above {HITL_QTY_THRESHOLD} shares are automatically held for human approval by a guardrail. "
+     "When that happens, never retry and never split the order — simply tell the user it is on hold.\n\n"
+     "In your final answer, always state: (a) what the Data Analyst found, (b) the CRO's verdict including the "
+     "backtested PnL, and (c) the action taken. Be professional and concise."),
     MessagesPlaceholder(variable_name="chat_history"),
     ("user", "{input}"),
-    MessagesPlaceholder(variable_name="agent_scratchpad")
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 
-agente_conversacional = create_tool_calling_agent(llm, herramientas, prompt_chat)
-agent_executor = AgentExecutor(agent=agente_conversacional, tools=herramientas, verbose=True)
+agente_conversacional = create_tool_calling_agent(llm, pm_tools, prompt_chat)
+agent_executor = AgentExecutor(
+    agent=agente_conversacional, tools=pm_tools,
+    verbose=True, return_intermediate_steps=True, max_iterations=10,
+)
 
+# --------------------------------------------------------------------------
+# Señales algorítmicas y estrategia
+# --------------------------------------------------------------------------
 def generate_ai_recommendation(symbol, timeframe="1Day"):
     cache_key = f"ai_rec:{symbol}:{timeframe}"
     cached = cache_get(cache_key)
     if cached: return cached
 
     bars = get_bars(symbol, timeframe=timeframe, limit=20)
-    if not bars or len(bars) < 2: 
+    if not bars or len(bars) < 2:
         return {"signal": "N/A", "confidence": "NONE", "rationale": "Market data unavailable from feed.", "projection": []}
-    
+
     closes = [b["close"] for b in bars]
     tendencia = closes[-1] / (closes[0] if closes[0] else 1)
-    
+
     sig = "BUY" if tendencia > 1.02 else "SELL" if tendencia < 0.98 else "HOLD"
     data = {"signal": sig, "confidence": "MEDIUM", "rationale": f"Algorithmic momentum evaluated over last {len(bars)} periods ({timeframe})."}
 
     try: last_date = datetime.fromisoformat(bars[-1]["time"][:10])
-    except: last_date = datetime.now()
+    except Exception: last_date = datetime.now()
 
     drift = 0.005 if sig == "BUY" else (-0.005 if sig == "SELL" else 0.0)
     projection = []
@@ -499,6 +844,10 @@ def api_recommend(symbol):
 def api_strategy(symbol):
     return jsonify(generate_strategy(symbol.upper(), request.args.get("timeframe", "1Day")))
 
+@app.route("/api/backtest/<symbol>")
+def api_backtest(symbol):
+    return jsonify(run_backtest(symbol.upper(), request.args.get("timeframe", "1Day")))
+
 @app.route("/api/news")
 def api_news_endpoint():
     return jsonify(get_news(request.args.get("symbol")))
@@ -508,14 +857,65 @@ def api_chat():
     global chat_memory
     data = request.get_json(force=True)
     user_msg = data.get("message", "")
+    trace_reset()
     try:
         res = agent_executor.invoke({"input": user_msg, "chat_history": chat_memory})
         reply = res["output"]
         chat_memory.extend([HumanMessage(content=user_msg), AIMessage(content=reply)])
         if len(chat_memory) > 20: chat_memory = chat_memory[-20:]
-        return jsonify({"reply": reply})
+        return jsonify({
+            "reply": reply,
+            "trace": trace_get(),
+            "pending_approval": trace_get_pending(),
+        })
     except Exception as exc:
-        return jsonify({"reply": "⚠️ Connection error with agents. Please check endpoint status."})
+        app.logger.exception("Agent failure")
+        return jsonify({
+            "reply": "⚠️ Connection error with agents. Please check endpoint status.",
+            "trace": trace_get(),
+            "pending_approval": trace_get_pending(),
+            "error": str(exc),
+        })
+
+@app.route("/api/trade/pending")
+def api_trade_pending():
+    with _pending_lock:
+        return jsonify([t for t in pending_trades.values() if t["status"] == "pending"])
+
+@app.route("/api/trade/resolve", methods=["POST"])
+def api_trade_resolve():
+    """Human-in-the-loop: el usuario aprueba o rechaza una orden retenida por el guardrail."""
+    body = request.get_json(force=True)
+    tid = body.get("id")
+    decision = (body.get("decision") or "").lower()
+
+    with _pending_lock:
+        record = pending_trades.get(tid)
+        if not record:
+            return jsonify({"error": "Ticket no encontrado."}), 404
+        if record["status"] != "pending":
+            return jsonify({"error": f"Este ticket ya fue {record['status']}."}), 409
+        if decision not in ("approve", "reject"):
+            return jsonify({"error": "Decisión inválida."}), 400
+        record["status"] = "processing" if decision == "approve" else "rejected"
+
+    if decision == "reject":
+        chat_memory.append(AIMessage(
+            content=f"[HITL] El usuario RECHAZÓ la orden {tid}: {record['side'].upper()} {record['qty']} {record['symbol']}. No se ejecutó."))
+        return jsonify({"id": tid, "status": "rejected",
+                        "message": f"Orden {record['side'].upper()} {record['qty']} {record['symbol']} rechazada por el usuario."})
+
+    ok, payload = _place_order(record["symbol"], record["side"], record["qty"])
+    with _pending_lock:
+        record["status"] = "executed" if ok else "failed"
+        record["result"] = payload if isinstance(payload, str) else "ok"
+
+    if ok:
+        chat_memory.append(AIMessage(
+            content=f"[HITL] El usuario APROBÓ la orden {tid}: {record['side'].upper()} {record['qty']} {record['symbol']}. Ejecutada."))
+        return jsonify({"id": tid, "status": "executed",
+                        "message": f"Orden {record['side'].upper()} {record['qty']} {record['symbol']} enviada al broker."})
+    return jsonify({"id": tid, "status": "failed", "message": f"El broker rechazó la orden: {payload}"}), 400
 
 @app.route("/api/account")
 def api_account():
@@ -527,7 +927,7 @@ def api_positions():
     try: return jsonify(requests.get(f"{ALPACA_TRADING_URL}/positions", headers=alpaca_headers(), timeout=5).json())
     except Exception as e: return jsonify({"error": str(e)}), 500
 
-# NUEVA RUTA: Permite ver órdenes pendientes cuando el mercado está cerrado
+# Permite ver órdenes pendientes cuando el mercado está cerrado
 @app.route("/api/orders_pending")
 def api_orders_pending():
     try: return jsonify(requests.get(f"{ALPACA_TRADING_URL}/orders?status=open", headers=alpaca_headers(), timeout=5).json())
@@ -536,12 +936,9 @@ def api_orders_pending():
 @app.route("/api/order", methods=["POST"])
 def api_order():
     data = request.json
-    payload = {"symbol": data["symbol"].upper(), "qty": data.get("qty", 1), "side": data["side"], "type": "market", "time_in_force": "day"}
-    try:
-        r = requests.post(f"{ALPACA_TRADING_URL}/orders", headers=alpaca_headers(), json=payload, timeout=5)
-        if r.status_code in [200, 201]: return jsonify(r.json()), 200
-        else: return jsonify({"error": r.json().get("message", "Order rejected by broker")}), 400
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    ok, payload = _place_order(data["symbol"], data["side"], data.get("qty", 1))
+    if ok: return jsonify(payload), 200
+    return jsonify({"error": payload}), 400
 
 # --------------------------------------------------------------------------
 # Frontend HTML
@@ -562,17 +959,17 @@ INDEX_HTML = """<!DOCTYPE html>
   .panel-2 { background: var(--panel-2); border: 1px solid var(--border); }
   ::-webkit-scrollbar { width: 4px; height: 4px; }
   ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 2px; }
-  
+
   @keyframes ticker-scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
   .ticker-track { animation: ticker-scroll 30s linear infinite; }
-  
+
   @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
   .live-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
   .fade-in { animation: fadeIn .25s ease-out; }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
-  .chat-msg-user { background: #111827; text-align: right; border-left: 2px solid #3b82f6; }
+  .chat-msg-user { background: #111827; text-align: right; border-left: 2px solid #3b82f6; padding: 8px; }
   .chat-msg-ai { background: #050505; border-left: 2px solid var(--accent); white-space: pre-wrap; padding: 8px; }
-  
+
   .search-results { position: absolute; top: 100%; left: 0; right: 0; background: #050505; border: 1px solid var(--border); z-index: 50; max-height: 150px; overflow-y: auto; }
   .search-item { padding: 4px 8px; cursor: pointer; display: flex; justify-content: space-between; font-size: 10px; }
   .search-item:hover { background: #1e293b; }
@@ -581,14 +978,39 @@ INDEX_HTML = """<!DOCTYPE html>
   .bg-buy { background: #10b981; color: black; }
   .bg-sell { background: #ef4444; color: white; }
   .bg-hold, .bg-n\\/a { background: #6b7280; color: white; }
-  
+
   .tf-btn { padding: 2px 8px; border: 1px solid var(--border); font-size: 10px; cursor: pointer; background: transparent; color: #9ca3af; }
   .tf-btn.active { background: #10b981; color: black; font-weight: bold; border-color: #10b981; }
 
   .ind-btn { padding: 2px 7px; border: 1px solid var(--border); font-size: 9px; cursor: pointer; background: transparent; color: #9ca3af; white-space: nowrap; }
   .ind-btn.active { background: #1e293b; color: #34d399; border-color: #10b981; font-weight: bold; }
 
-  /* Professional Toast Notifications */
+  /* Agent Trace */
+  .trace-box { margin-top: 8px; border: 1px solid var(--border); background: #000; white-space: normal; }
+  .trace-box > summary { cursor: pointer; padding: 4px 8px; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; color: #64748b; list-style: none; user-select: none; }
+  .trace-box > summary:hover { color: #34d399; }
+  .trace-box[open] > summary { border-bottom: 1px solid var(--border); color: #34d399; }
+  .trace-step { padding: 5px 8px; border-bottom: 1px dashed #111827; font-size: 9px; }
+  .trace-step:last-child { border-bottom: none; }
+  .trace-head { display: flex; gap: 6px; align-items: center; margin-bottom: 2px; }
+  .trace-agent { color: #a78bfa; font-weight: bold; }
+  .trace-tool { color: #22d3ee; }
+  .trace-ts { color: #374151; margin-left: auto; }
+  .trace-io { color: #6b7280; line-height: 1.35; word-break: break-word; }
+  .trace-label { display: inline-block; min-width: 22px; color: #374151; }
+  .trace-rail { border-left: 2px solid #1e293b; }
+
+  /* Human-in-the-loop card */
+  .hitl-card { margin-top: 8px; border: 1px solid #78350f; background: #1c1207; padding: 10px; white-space: normal; }
+  .hitl-title { color: #fbbf24; font-weight: bold; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 4px; }
+  .hitl-detail { color: #d1d5db; font-size: 10px; margin-bottom: 8px; }
+  .hitl-btn { padding: 4px 14px; font-size: 10px; font-weight: bold; cursor: pointer; border: none; }
+  .hitl-approve { background: #10b981; color: #000; }
+  .hitl-approve:hover { background: #34d399; }
+  .hitl-reject { background: #ef4444; color: #fff; }
+  .hitl-reject:hover { background: #f87171; }
+  .hitl-btn:disabled { opacity: .4; cursor: not-allowed; }
+
   #toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
   .toast { background: #050505; border-left: 4px solid var(--accent); padding: 12px 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.8); color: #d1d5db; min-width: 280px; font-family: ui-monospace, monospace; animation: slideIn 0.3s ease-out forwards; }
   @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
@@ -603,6 +1025,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 live-dot"></div>
       <h1 class="text-sm font-bold tracking-widest text-emerald-400">TCS CAPITAL MARKETS // AI TERMINAL</h1>
       <span class="text-[10px] text-gray-500 border border-[var(--border)] rounded px-2">PAPER TRADING LIVE</span>
+      <span class="text-[10px] text-violet-400 border border-violet-900 rounded px-2">MULTI-AGENT A2A</span>
     </div>
   </header>
 
@@ -659,7 +1082,7 @@ INDEX_HTML = """<!DOCTYPE html>
               <span id="aiRationale" class="text-[10px] text-gray-400 italic max-w-xs truncate"></span>
             </div>
           </div>
-          
+
           <div class="flex gap-1">
             <button class="tf-btn active" data-tf="1Day">1D</button>
             <button class="tf-btn" data-tf="1Week">1W</button>
@@ -670,10 +1093,12 @@ INDEX_HTML = """<!DOCTYPE html>
             <input id="tradeQty" type="number" min="1" value="1" class="w-14 bg-black border border-[var(--border)] text-white text-center py-1 text-xs focus:outline-none focus:border-emerald-400">
             <button onclick="executeOrder('buy')" class="bg-emerald-600 hover:bg-emerald-500 text-black font-bold px-4 py-1 text-xs">BUY</button>
             <button onclick="executeOrder('sell')" class="bg-red-600 hover:bg-red-500 text-white font-bold px-4 py-1 text-xs">SELL</button>
-            <button id="strategyBtn" onclick="runStrategy()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-1 text-xs">📊 ESTRATEGIA</button>
+            <button id="strategyBtn" onclick="runStrategy()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-3 py-1 text-xs">📊 ESTRATEGIA</button>
+            <button id="backtestBtn" onclick="runBacktest()" class="bg-violet-600 hover:bg-violet-500 text-white font-bold px-3 py-1 text-xs">⏱ BACKTEST</button>
           </div>
         </div>
         <div id="strategyPanel" class="hidden absolute top-14 right-4 z-30 w-72 panel border border-blue-800 p-3 glow"></div>
+        <div id="backtestPanel" class="hidden absolute top-14 right-4 z-30 w-80 panel border border-violet-800 p-3 glow"></div>
 
         <div class="flex flex-wrap items-center gap-1 mb-1 shrink-0 bg-black p-1.5 border border-[var(--border)] relative z-20">
           <span class="text-[9px] text-gray-500 uppercase mr-1">Indicadores:</span>
@@ -704,12 +1129,14 @@ INDEX_HTML = """<!DOCTYPE html>
         </section>
 
         <section class="panel w-2/3 flex flex-col overflow-hidden p-3">
-          <h2 class="uppercase tracking-widest text-emerald-400 mb-2 font-bold flex gap-2">
-            Autonomous Agent Desk <span class="bg-emerald-900 text-emerald-300 px-1 rounded text-[9px]">AUTO-TRADE ENABLED</span>
+          <h2 class="uppercase tracking-widest text-emerald-400 mb-2 font-bold flex gap-2 items-center">
+            Portfolio Manager Desk
+            <span class="bg-violet-900 text-violet-300 px-1 rounded text-[9px]">A2A · ANALYST + CRO</span>
+            <span class="bg-yellow-900 text-yellow-300 px-1 rounded text-[9px]">HITL GUARDRAIL</span>
           </h2>
           <div id="chatMessages" class="flex-1 overflow-y-auto space-y-2 mb-2 pr-1"></div>
           <form id="chatForm" class="flex gap-1 shrink-0">
-            <input id="chatInput" type="text" placeholder="E.g. 'Analyze AAPL news and if it's bullish, buy 2 shares automatically'..."
+            <input id="chatInput" type="text" placeholder="Ej. 'Evalúa AAPL con el analista y el CRO, y si aprueban compra 2 acciones'..."
                    class="flex-1 bg-black border border-[var(--border)] px-2 py-1.5 focus:outline-none focus:border-emerald-400 text-white" />
             <button class="bg-emerald-600 hover:bg-emerald-500 text-black font-bold px-4">SEND</button>
           </form>
@@ -719,20 +1146,26 @@ INDEX_HTML = """<!DOCTYPE html>
   </main>
 
 <script>
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function showToast(title, message, type='success') {
   const container = document.getElementById('toast-container');
   const toast = document.createElement('div');
   const borderColor = type === 'success' ? '#10b981' : (type === 'error' ? '#ef4444' : '#3b82f6');
   toast.className = 'toast border border-[var(--border)]';
   toast.style.borderLeftColor = borderColor;
-  toast.innerHTML = `<div class="font-bold text-white text-xs mb-1 uppercase tracking-wider">${title}</div><div class="text-[10px] text-gray-400">${message}</div>`;
+  toast.innerHTML = `<div class="font-bold text-white text-xs mb-1 uppercase tracking-wider">${esc(title)}</div><div class="text-[10px] text-gray-400">${esc(message)}</div>`;
   container.appendChild(toast);
   setTimeout(() => toast.remove(), 6000);
 }
 
 let watchlist = JSON.parse(localStorage.getItem('tcs_wl')) || ["AAPL", "MSFT", "TSLA"];
 let activeSymbol = watchlist[0];
-let activeTimeframe = "1Day"; 
+let activeTimeframe = "1Day";
 
 let chart, candleSeries;
 let extraSeries = [];
@@ -752,6 +1185,7 @@ function clearStrategy() {
   strategyLines = [];
   candleSeries.setMarkers([]);
   document.getElementById('strategyPanel').classList.add('hidden');
+  document.getElementById('backtestPanel').classList.add('hidden');
 }
 
 function initChart() {
@@ -941,14 +1375,14 @@ async function loadSymbol(sym, timeframe = null) {
   if(timeframe) activeTimeframe = timeframe;
   document.getElementById('activeSymbol').textContent = sym;
   clearStrategy();
-  
+
   document.querySelectorAll('.tf-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tf === activeTimeframe));
   highlightWatchlist();
-  
+
   const res = await fetch(`/api/bars/${sym}?timeframe=${activeTimeframe}&limit=150`);
   const data = await res.json();
   const chartErrorDiv = document.getElementById('chartError');
-  
+
   if(data.bars?.length > 0) {
     chartErrorDiv.classList.add('hidden');
     const seen = new Set();
@@ -972,7 +1406,7 @@ async function loadSymbol(sym, timeframe = null) {
   document.getElementById('aiBadge').className = 'badge bg-gray-600';
   document.getElementById('aiBadge').textContent = 'ANALYZING...';
   document.getElementById('aiRationale').textContent = '';
-  
+
   fetch(`/api/recommend/${sym}?timeframe=${activeTimeframe}`).then(r => r.json()).then(ai => {
     if(activeSymbol !== sym) return;
     const badge = document.getElementById('aiBadge');
@@ -1000,10 +1434,10 @@ async function updateWatchlistUI() {
     row.dataset.symbol = q.symbol;
     row.onclick = () => loadSymbol(q.symbol);
     row.innerHTML = `
-        <span class="font-bold">${q.symbol}</span> 
+        <span class="font-bold">${esc(q.symbol)}</span>
         <div class="flex items-center gap-2">
             <span>${q.price > 0 ? q.price.toFixed(2) : '—'}</span>
-            <button class="text-red-500 hover:text-red-300 font-bold px-1" onclick="removeFromWatchlist('${q.symbol}', event)">×</button>
+            <button class="text-red-500 hover:text-red-300 font-bold px-1" onclick="removeFromWatchlist('${esc(q.symbol)}', event)">×</button>
         </div>
     `;
     listEl.appendChild(row);
@@ -1012,7 +1446,7 @@ async function updateWatchlistUI() {
 
   const track = document.getElementById('tickerTrack');
   if (track) {
-      const html = quotes.map(q => `<span class="text-gray-400">${q.symbol} <span class="text-emerald-300">${q.price.toFixed(2)}</span></span>`).join('');
+      const html = quotes.map(q => `<span class="text-gray-400">${esc(q.symbol)} <span class="text-emerald-300">${q.price.toFixed(2)}</span></span>`).join('');
       track.innerHTML = html + html;
   }
 }
@@ -1035,7 +1469,7 @@ searchInput.addEventListener('input', (e) => {
       matches.forEach(m => {
         const div = document.createElement('div');
         div.className = 'search-item';
-        div.innerHTML = `<span class="font-bold text-emerald-400">${m.symbol}</span> <span class="text-gray-400 truncate ml-2">${m.name}</span>`;
+        div.innerHTML = `<span class="font-bold text-emerald-400">${esc(m.symbol)}</span> <span class="text-gray-400 truncate ml-2">${esc(m.name)}</span>`;
         div.onclick = () => {
           if(!watchlist.includes(m.symbol)) { watchlist.push(m.symbol); localStorage.setItem('tcs_wl', JSON.stringify(watchlist)); updateWatchlistUI(); }
           loadSymbol(m.symbol); searchInput.value = ''; searchResults.classList.add('hidden');
@@ -1058,17 +1492,15 @@ async function fetchPortfolio() {
 
   const posRes = await fetch('/api/positions');
   const pos = await posRes.json();
-  
-  // NEW: Fetch Pending Orders since the market might be closed
+
   const ordersRes = await fetch('/api/orders_pending');
   const orders = await ordersRes.json();
-  
+
   const listEl = document.getElementById('positionsList');
   listEl.innerHTML = '';
-  
+
   let hasItems = false;
 
-  // Render open positions
   if(!pos.error && pos.length > 0) {
     hasItems = true;
     pos.forEach(p => {
@@ -1076,21 +1508,20 @@ async function fetchPortfolio() {
       const row = document.createElement('div');
       row.className = 'flex justify-between items-center text-[10px] p-1 bg-black border border-[var(--border)]';
       row.innerHTML = `
-        <div><span class="font-bold text-white">${p.symbol}</span> <span class="text-gray-500">${p.qty} sh</span></div>
+        <div><span class="font-bold text-white">${esc(p.symbol)}</span> <span class="text-gray-500">${esc(p.qty)} sh</span></div>
         <div class="${pl>=0?'text-emerald-400':'text-red-400'}">${pl>=0?'+':''}${pl.toFixed(2)}</div>
       `;
       listEl.appendChild(row);
     });
   }
-  
-  // Render pending orders (queued because market is closed)
+
   if(!orders.error && orders.length > 0) {
     hasItems = true;
     orders.forEach(o => {
       const row = document.createElement('div');
       row.className = 'flex justify-between items-center text-[10px] p-1 bg-black border border-yellow-900/50 mt-1';
       row.innerHTML = `
-        <div><span class="font-bold text-yellow-500">${o.symbol}</span> <span class="text-gray-500">${o.qty} sh (${o.side.toUpperCase()})</span></div>
+        <div><span class="font-bold text-yellow-500">${esc(o.symbol)}</span> <span class="text-gray-500">${esc(o.qty)} sh (${esc(o.side.toUpperCase())})</span></div>
         <div class="text-yellow-600 bg-yellow-900/20 px-1 rounded">PENDING</div>
       `;
       listEl.appendChild(row);
@@ -1114,7 +1545,7 @@ async function executeOrder(side) {
         body: JSON.stringify({ symbol: activeSymbol, side: side, qty: qty })
       });
       const data = await res.json();
-      
+
       if(data.error) {
           showToast('ORDER REJECTED', data.error, 'error');
       } else {
@@ -1131,30 +1562,30 @@ async function executeOrder(side) {
 async function refreshNews(symbol) {
   const box = document.getElementById('newsList');
   box.innerHTML = '<div class="text-gray-500 text-center mt-4">Analyzing sentiment via LLM...</div>';
-  
+
   const res = await fetch(`/api/news?symbol=${symbol}`);
   const items = await res.json();
   box.innerHTML = '';
-  
+
   if(items.length === 0) {
       box.innerHTML = '<div class="text-gray-600 italic text-center mt-4">No recent news available.</div>';
       return;
   }
-  
+
   items.forEach(it => {
     const div = document.createElement('div');
     div.className = 'fade-in panel-2 border border-[var(--border)] p-2 mb-1';
-    
-    let badgeClass = 'bg-hold'; 
+
+    let badgeClass = 'bg-hold';
     if(it.sentiment === 'BULLISH') badgeClass = 'bg-buy';
     if(it.sentiment === 'BEARISH') badgeClass = 'bg-sell';
-    
+
     div.innerHTML = `
       <div class="flex justify-between items-start mb-1 gap-2">
-        <a href="${it.link}" target="_blank" class="text-emerald-300 font-bold hover:underline text-[10px] leading-tight flex-1">${it.title}</a>
-        <span class="badge ${badgeClass} text-[8px] px-1">${it.sentiment}</span>
+        <a href="${esc(it.link)}" target="_blank" class="text-emerald-300 font-bold hover:underline text-[10px] leading-tight flex-1">${esc(it.title)}</a>
+        <span class="badge ${badgeClass} text-[8px] px-1">${esc(it.sentiment)}</span>
       </div>
-      <div class="text-gray-500 text-[9px] leading-tight">${it.summary || ''}</div>
+      <div class="text-gray-500 text-[9px] leading-tight">${esc(it.summary || '')}</div>
     `;
     box.appendChild(div);
   });
@@ -1173,7 +1604,6 @@ async function runStrategy() {
 
     if (s.error) { showToast('ESTRATEGIA', s.error, 'error'); return; }
 
-    // Líneas horizontales: entrada, take-profit (positivo), stop-loss (negativo)
     strategyLines.push(candleSeries.createPriceLine({
       price: s.entry, color: '#3b82f6', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid,
       axisLabelVisible: true, title: `ENTRADA ${s.entry}`
@@ -1187,7 +1617,6 @@ async function runStrategy() {
       axisLabelVisible: true, title: `SL (-) ${s.stop_loss}`
     }));
 
-    // Flecha de señal sobre la última vela
     const color = s.signal === 'BUY' ? '#10b981' : (s.signal === 'SELL' ? '#ef4444' : '#9ca3af');
     const shape = s.signal === 'BUY' ? 'arrowUp' : (s.signal === 'SELL' ? 'arrowDown' : 'circle');
     const position = s.signal === 'SELL' ? 'aboveBar' : 'belowBar';
@@ -1207,7 +1636,7 @@ function showStrategyPanel(s) {
   const badgeClass = s.signal === 'BUY' ? 'bg-buy' : (s.signal === 'SELL' ? 'bg-sell' : 'bg-hold');
   panel.innerHTML = `
     <div class="flex items-center justify-between mb-2">
-      <span class="badge ${badgeClass}">${s.signal}</span>
+      <span class="badge ${badgeClass}">${esc(s.signal)}</span>
       <span class="text-[9px] text-gray-500">R:R ${s.risk_reward ?? '—'}</span>
       <button onclick="clearStrategy()" class="text-gray-500 hover:text-white text-sm leading-none">×</button>
     </div>
@@ -1216,21 +1645,161 @@ function showStrategyPanel(s) {
       <div><div class="text-gray-500">TP (+)</div><div class="text-emerald-400 font-bold">${s.take_profit}</div></div>
       <div><div class="text-gray-500">SL (-)</div><div class="text-red-400 font-bold">${s.stop_loss}</div></div>
     </div>
-    <div class="text-[9px] text-gray-400 mb-2 leading-snug">${s.rationale}</div>
-    <div class="text-[9px] text-emerald-300 mb-1 leading-snug">▲ ${s.positive_scenario}</div>
-    <div class="text-[9px] text-red-300 leading-snug">▼ ${s.negative_scenario}</div>
+    <div class="text-[9px] text-gray-400 mb-2 leading-snug">${esc(s.rationale)}</div>
+    <div class="text-[9px] text-emerald-300 mb-1 leading-snug">▲ ${esc(s.positive_scenario)}</div>
+    <div class="text-[9px] text-red-300 leading-snug">▼ ${esc(s.negative_scenario)}</div>
   `;
   panel.classList.remove('hidden');
 }
 
+async function runBacktest() {
+  const btn = document.getElementById('backtestBtn');
+  const original = btn.textContent;
+  btn.textContent = 'SIMULANDO...';
+  btn.disabled = true;
+  document.getElementById('strategyPanel').classList.add('hidden');
+
+  try {
+    const res = await fetch(`/api/backtest/${activeSymbol}?timeframe=${activeTimeframe}`);
+    const bt = await res.json();
+    if (bt.error) { showToast('BACKTEST', bt.error, 'error'); return; }
+    showBacktestPanel(bt);
+  } catch (e) {
+    showToast('BACKTEST', 'No se pudo correr la simulación.', 'error');
+  } finally {
+    btn.textContent = original;
+    btn.disabled = false;
+  }
+}
+
+function showBacktestPanel(bt) {
+  const panel = document.getElementById('backtestPanel');
+  const pnlColor = bt.total_pnl >= 0 ? 'text-emerald-400' : 'text-red-400';
+  const beats = bt.beats_buy_and_hold;
+  const rows = (bt.trades || []).map(t => `
+    <div class="flex justify-between text-[9px] border-b border-[#111827] py-0.5">
+      <span class="text-gray-500">${esc(t.entry_time)} → ${esc(t.exit_time)}</span>
+      <span class="${t.pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}">${t.pnl >= 0 ? '+' : ''}${t.pnl} (${t.pnl_pct}%)</span>
+    </div>`).join('');
+
+  panel.innerHTML = `
+    <div class="flex items-center justify-between mb-2">
+      <span class="text-violet-300 font-bold text-[10px] uppercase tracking-wider">Backtest · ${esc(bt.symbol)}</span>
+      <button onclick="document.getElementById('backtestPanel').classList.add('hidden')" class="text-gray-500 hover:text-white text-sm leading-none">×</button>
+    </div>
+    <div class="text-[9px] text-gray-500 mb-2">${esc(bt.strategy)} · ${bt.periods_tested} periodos</div>
+    <div class="grid grid-cols-3 gap-1 text-center text-[9px] mb-2">
+      <div><div class="text-gray-500">PnL TEÓRICO</div><div class="${pnlColor} font-bold">$${bt.total_pnl}</div></div>
+      <div><div class="text-gray-500">RETORNO</div><div class="${pnlColor} font-bold">${bt.total_pnl_pct}%</div></div>
+      <div><div class="text-gray-500">WIN RATE</div><div class="text-white font-bold">${bt.win_rate_pct}%</div></div>
+    </div>
+    <div class="text-[9px] mb-2 p-1 border ${beats ? 'border-emerald-800 text-emerald-300' : 'border-red-900 text-red-300'}">
+      ${beats ? '▲' : '▼'} Estrategia ${bt.total_pnl_pct}% vs Buy &amp; Hold ${bt.buy_and_hold_pct}%
+    </div>
+    <div class="text-[9px] text-gray-500 mb-1">${bt.num_trades} operaciones · mejor $${bt.best_trade} · peor $${bt.worst_trade}</div>
+    <div class="max-h-24 overflow-y-auto">${rows || '<div class="text-gray-600 italic text-[9px]">Sin cruces en el periodo.</div>'}</div>
+  `;
+  panel.classList.remove('hidden');
+}
+
+// ------------------------------------------------------------------
+// CHAT + AGENT TRACE + HUMAN-IN-THE-LOOP
+// ------------------------------------------------------------------
 function appendChat(role, text) {
   const box = document.getElementById('chatMessages');
   const div = document.createElement('div');
-  div.className = `fade-in p-2 ${role==='user'?'chat-msg-user':'chat-msg-ai'}`;
+  div.className = `fade-in ${role==='user'?'chat-msg-user':'chat-msg-ai'}`;
   div.textContent = text;
   box.appendChild(div);
   box.scrollTop = box.scrollHeight;
   return div;
+}
+
+function buildTraceBox(trace) {
+  const det = document.createElement('details');
+  det.className = 'trace-box';
+  const agentsUsed = [...new Set(trace.map(t => t.agent))].length;
+  const steps = trace.map(t => `
+    <div class="trace-step ${t.level > 0 ? 'trace-rail' : ''}" style="margin-left:${t.level * 12}px">
+      <div class="trace-head">
+        <span class="trace-agent">${esc(t.agent)}</span>
+        <span class="trace-tool">${esc(t.tool)}</span>
+        <span class="trace-ts">${esc(t.ts)}</span>
+      </div>
+      ${t.input ? `<div class="trace-io"><span class="trace-label">IN</span>${esc(t.input)}</div>` : ''}
+      ${t.output ? `<div class="trace-io"><span class="trace-label">OUT</span>${esc(t.output)}</div>` : ''}
+    </div>`).join('');
+  det.innerHTML = `<summary>▸ Agent Trace · ${trace.length} pasos · ${agentsUsed} agentes</summary>${steps}`;
+  return det;
+}
+
+function buildHitlCard(p) {
+  const card = document.createElement('div');
+  card.className = 'hitl-card';
+  card.innerHTML = `
+    <div class="hitl-title">⚠ Guardrail · Se requiere aprobación humana</div>
+    <div class="hitl-detail">
+      El agente intentó ejecutar <b class="text-white">${esc(p.side.toUpperCase())} ${p.qty} ${esc(p.symbol)}</b>,
+      por encima del límite de ejecución automática. La orden NO se envió al broker.
+      <span class="text-gray-500">Ticket ${esc(p.id)} · ${esc(p.created)}</span>
+    </div>
+    <div class="flex gap-2">
+      <button class="hitl-btn hitl-approve">✓ APROBAR</button>
+      <button class="hitl-btn hitl-reject">✕ RECHAZAR</button>
+    </div>
+    <div class="hitl-status text-[9px] mt-2"></div>
+  `;
+  const [approveBtn, rejectBtn] = card.querySelectorAll('.hitl-btn');
+  const status = card.querySelector('.hitl-status');
+
+  async function resolve(decision) {
+    approveBtn.disabled = true; rejectBtn.disabled = true;
+    status.textContent = 'Procesando...';
+    status.className = 'hitl-status text-[9px] mt-2 text-gray-400';
+    try {
+      const res = await fetch('/api/trade/resolve', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ id: p.id, decision })
+      });
+      const data = await res.json();
+      if (data.error) {
+        status.textContent = data.error;
+        status.className = 'hitl-status text-[9px] mt-2 text-red-400';
+        return;
+      }
+      status.textContent = data.message;
+      status.className = `hitl-status text-[9px] mt-2 ${data.status === 'executed' ? 'text-emerald-400' : 'text-yellow-400'}`;
+      showToast('HUMAN-IN-THE-LOOP', data.message, data.status === 'executed' ? 'success' : 'info');
+      if (data.status === 'executed') {
+        setTimeout(fetchPortfolio, 1000);
+        setTimeout(fetchPortfolio, 4000);
+      }
+    } catch (e) {
+      status.textContent = 'Error de conexión al resolver el ticket.';
+      status.className = 'hitl-status text-[9px] mt-2 text-red-400';
+      approveBtn.disabled = false; rejectBtn.disabled = false;
+    }
+  }
+
+  approveBtn.onclick = () => resolve('approve');
+  rejectBtn.onclick = () => resolve('reject');
+  return card;
+}
+
+function renderAgentReply(data) {
+  const box = document.getElementById('chatMessages');
+  const wrap = document.createElement('div');
+  wrap.className = 'fade-in chat-msg-ai';
+
+  const body = document.createElement('div');
+  body.textContent = data.reply;
+  wrap.appendChild(body);
+
+  if (data.trace && data.trace.length) wrap.appendChild(buildTraceBox(data.trace));
+  if (data.pending_approval) wrap.appendChild(buildHitlCard(data.pending_approval));
+
+  box.appendChild(wrap);
+  box.scrollTop = box.scrollHeight;
 }
 
 document.getElementById('chatForm').addEventListener('submit', async (e) => {
@@ -1240,13 +1809,18 @@ document.getElementById('chatForm').addEventListener('submit', async (e) => {
   if(!msg) return;
   appendChat('user', msg);
   input.value = '';
-  const thinking = appendChat('ai', 'Evaluating market and executing conditions...');
-  
-  const res = await fetch('/api/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg }) });
-  const data = await res.json();
-  thinking.textContent = data.reply;
-  
-  setTimeout(fetchPortfolio, 2000); 
+  const thinking = appendChat('ai', 'Portfolio Manager coordinando al Data Analyst y al CRO...');
+
+  try {
+    const res = await fetch('/api/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ message: msg }) });
+    const data = await res.json();
+    thinking.remove();
+    renderAgentReply(data);
+  } catch (err) {
+    thinking.textContent = '⚠️ Error de conexión con el desk de agentes.';
+  }
+
+  setTimeout(fetchPortfolio, 2000);
   setTimeout(fetchPortfolio, 5000);
 });
 
@@ -1255,7 +1829,7 @@ initRsiChart();
 loadSymbol(activeSymbol, "1Day");
 updateWatchlistUI();
 fetchPortfolio();
-appendChat('ai', 'TCS AI Desk ready. I can fetch real-time prices, analyze news, and EXECUTE TRADES automatically.');
+appendChat('ai', 'TCS AI Desk listo. Soy el Portfolio Manager: coordino al Data Analyst (precios, noticias, técnicos) y al CRO (backtest y riesgo). Puedo ejecutar operaciones, pero las órdenes grandes requieren tu aprobación.');
 setInterval(fetchPortfolio, 15000);
 </script>
 </body>
