@@ -31,6 +31,9 @@ def _float(name, default):
 ALPACA_KEY_ID = os.environ.get("ALPACA_KEY_ID", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_DATA_URL = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets/v2")
+ALPACA_NEWS_URL = os.environ.get("ALPACA_NEWS_URL", "https://data.alpaca.markets/v1beta1/news")
+# "iex" is the free-tier feed. "sip" needs a paid market-data subscription.
+ALPACA_FEED = os.environ.get("ALPACA_FEED", "iex")
 ALPACA_TRADING_URL = os.environ.get("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets/v2")
 
 # ---------------------------------------------------------------- LLM
@@ -40,10 +43,11 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "azure/genailab-maas-gpt-4.1")
 LLM_TEMPERATURE = _float("LLM_TEMPERATURE", 0.2)
 LLM_TIMEOUT_SECONDS = _int("LLM_TIMEOUT_SECONDS", 90)
 
-# Fallback provider, used when the primary LLM endpoint is unavailable.
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+# Chain-of-thought to stdout. Off by default: the trace panel in the UI
+# already carries it, and the console dump made the terminal unreadable.
+AGENT_VERBOSE = _flag("AGENT_VERBOSE", "0")
+# Max sentences the Portfolio Manager may use in a chat reply.
+CHAT_MAX_SENTENCES = _int("CHAT_MAX_SENTENCES", 4)
 
 # ---------------------------------------------------------------- guardrails
 # Any single order above this size is held for human approval.

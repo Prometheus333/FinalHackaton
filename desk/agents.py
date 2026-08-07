@@ -37,43 +37,28 @@ _primary_llm = ChatOpenAI(
     cache=InMemoryCache(),
 )
 
-# Fallback provider (Groq, OpenAI-compatible) used when the primary endpoint is
-# down or errors out. Only wired in when a key is configured, so a missing
-# GROQ_API_KEY surfaces the primary's real error instead of a fallback auth error.
-_fallback_llm = ChatOpenAI(
-    base_url=config.GROQ_BASE_URL,
-    model=config.GROQ_MODEL,
-    api_key=config.GROQ_API_KEY or "unset",
-    http_client=_http,
-    temperature=config.LLM_TEMPERATURE,
-    cache=InMemoryCache(),
-) if config.GROQ_API_KEY else None
+ACTIVE_PROVIDER = {"base_url": config.LLM_BASE_URL, "model": config.LLM_MODEL}
 
 
-class _LLMWithFallback:
+llm = _primary_llm
+
+
+def ping(timeout_note=True):
     """
-    Duck-types just enough of the LangChain LLM surface (bind_tools, invoke) for
-    create_tool_calling_agent and direct .invoke() calls, transparently retrying
-    on the Groq fallback when the primary provider raises.
+    Round-trip the primary endpoint only, bypassing the fallback so a healthy
+    result always means genailab itself answered. Returns (ok, detail).
     """
-
-    def __init__(self, primary, fallback):
-        self._primary = primary
-        self._fallback = fallback
-
-    def bind_tools(self, tools, **kwargs):
-        bound = self._primary.bind_tools(tools, **kwargs)
-        if self._fallback is None:
-            return bound
-        return bound.with_fallbacks([self._fallback.bind_tools(tools, **kwargs)])
-
-    def invoke(self, *args, **kwargs):
-        if self._fallback is None:
-            return self._primary.invoke(*args, **kwargs)
-        return self._primary.with_fallbacks([self._fallback]).invoke(*args, **kwargs)
-
-
-llm = _LLMWithFallback(_primary_llm, _fallback_llm)
+    try:
+        res = _primary_llm.invoke("Reply with the single word: online")
+        return True, (res.content or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        detail = str(exc)
+        if timeout_note and "timeout" in detail.lower():
+            detail += (
+                f"  [endpoint reachable but slower than "
+                f"LLM_TIMEOUT_SECONDS={config.LLM_TIMEOUT_SECONDS}]"
+            )
+        return False, detail
 
 
 # --------------------------------------------------------------------------
@@ -339,7 +324,7 @@ cro_prompt = ChatPromptTemplate.from_messages([
 
 def _build(tools, prompt, max_iter):
     agent = create_tool_calling_agent(llm, tools, prompt)
-    return AgentExecutor(agent=agent, tools=tools, verbose=True,
+    return AgentExecutor(agent=agent, tools=tools, verbose=config.AGENT_VERBOSE,
                          return_intermediate_steps=True, max_iterations=max_iter,
                          handle_parsing_errors=True)
 
@@ -470,20 +455,27 @@ pm_prompt = ChatPromptTemplate.from_messages([
      "splitting an order will be blocked and logged. When an order is held, simply tell "
      "the user it is awaiting their decision.\n\n"
      + GROUNDING_RULE + "\n\n"
-     "Structure your final answer as:\n"
-     "  FINDINGS - what the analyst reported\n"
-     "  STRATEGY - the optimizer's tuned parameters and measured improvement\n"
-     "  RISK - the CRO's verdict, confidence and required stop-loss\n"
-     "  ACTION - what you did or why you did not\n"
-     "  LIMITS - the main caveat a trader should hold in mind\n"
-     "Be concise and professional."),
+     "HOW TO ANSWER\n"
+     f"Reply in plain conversational English, at most {config.CHAT_MAX_SENTENCES} short "
+     "sentences. No headings, no section labels, no bullet lists, no markdown. Write the "
+     "way a desk head answers a colleague who asked a quick question.\n"
+     "Lead with the answer itself: the call, the verdict, or what you did. Then at most "
+     "one sentence of reasoning with the single number that mattered most, and one short "
+     "caveat only if it would change the decision.\n"
+     "Do not restate what each specialist said, do not narrate which agents you "
+     "consulted, and do not list every metric you received. The user can open the trace "
+     "panel for the full detail; your job is the summary, not the transcript.\n"
+     "If the user explicitly asks for detail, a breakdown or the full analysis, then give "
+     "a longer structured answer.\n"
+     "For a greeting or a question that needs no market data, just answer it directly in "
+     "one sentence and call no tools at all."),
     MessagesPlaceholder(variable_name="chat_history"),
     ("user", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 
 pm_agent = create_tool_calling_agent(llm, pm_tools, pm_prompt)
-pm_executor = AgentExecutor(agent=pm_agent, tools=pm_tools, verbose=True,
+pm_executor = AgentExecutor(agent=pm_agent, tools=pm_tools, verbose=config.AGENT_VERBOSE,
                             return_intermediate_steps=True,
                             max_iterations=config.MAX_ITERATIONS_PM,
                             handle_parsing_errors=True)
@@ -512,8 +504,56 @@ def run_baseline(message):
         return f"Baseline model unavailable: {e}"
 
 
+_DETAIL_WORDS = ("detail", "detailed", "breakdown", "full analysis", "explain",
+                 "why exactly", "elaborate", "in depth", "step by step",
+                 "detalle", "detallado", "explica", "a fondo")
+
+_SECTION_LABELS = ("FINDINGS", "STRATEGY", "RISK", "ACTION", "LIMITS")
+
+
+def _condense(text, max_sentences):
+    """
+    Keeps the reply short regardless of whether the model honoured the prompt.
+    Prompts drift under long chat histories; this does not.
+    """
+    if not text:
+        return text
+
+    cleaned = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Drop leftover report scaffolding and markdown ornaments.
+        upper = stripped.upper()
+        if any(upper.startswith(lbl) for lbl in _SECTION_LABELS) and len(stripped) < 60:
+            continue
+        stripped = stripped.lstrip("#*->• ").replace("**", "")
+        for lbl in _SECTION_LABELS:
+            if stripped.upper().startswith(lbl + " "):
+                stripped = stripped[len(lbl):].lstrip(" -:")
+            elif stripped.upper().startswith(lbl + ":"):
+                stripped = stripped[len(lbl) + 1:].lstrip(" -")
+        if stripped:
+            cleaned.append(stripped)
+
+    joined = " ".join(cleaned)
+    parts = re.split(r"(?<=[.!?])\s+", joined)
+    parts = [p for p in parts if p.strip()]
+    if len(parts) <= max_sentences:
+        return joined.strip()
+    return " ".join(parts[:max_sentences]).strip()
+
+
 def run_desk(message, chat_history):
     """Runs the full agentic path. Returns the PM's answer text."""
     res = pm_executor.invoke({"input": message, "chat_history": chat_history},
                              config={"callbacks": _callbacks})
-    return res["output"]
+    output = res["output"]
+
+    # The user can always ask for the long version; the trace panel holds the
+    # complete detail either way, so trimming here loses nothing.
+    wants_detail = any(w in (message or "").lower() for w in _DETAIL_WORDS)
+    if not wants_detail:
+        output = _condense(output, config.CHAT_MAX_SENTENCES)
+    return output

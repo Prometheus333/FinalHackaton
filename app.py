@@ -15,6 +15,7 @@ Then open http://localhost:5000
 Demo without a live feed:
     SYNTHETIC_MODE=1 python app.py
 """
+import logging
 import os
 import threading
 import warnings
@@ -352,10 +353,17 @@ def api_trace(turn_id):
 @app.route("/api/health")
 def api_health():
     bars = market_data.get_bars("AAPL", limit=5)
+    llm_ok, llm_detail = (False, "agents module unavailable")
+    if agents is not None and request.args.get("probe") == "1":
+        llm_ok, llm_detail = agents.ping()
     return jsonify({
         "status": "ok" if bars else "degraded",
         "market_data": bool(bars),
         "agents": agents is not None,
+        "llm": {"ok": llm_ok, "detail": llm_detail[:300],
+                "model": config.LLM_MODEL},
+        "sources": dict(market_data.RUNTIME_SOURCE),
+        "alpaca_configured": market_data.alpaca_configured(),
         "storage": storage.stats(),
         "config": config.public_config(),
     })
@@ -387,6 +395,11 @@ def api_sim_scenario():
 @app.route("/")
 def index():
     return Response(ui.INDEX_HTML, mimetype="text/html")
+
+
+# Werkzeug logs every poll from the dashboard; at a 5s refresh that is a
+# wall of 200s that hides real errors. Warnings and above still show.
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
 if __name__ == "__main__":

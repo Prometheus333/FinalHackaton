@@ -26,6 +26,10 @@ _cache_lock = threading.Lock()
 
 _all_assets = []
 
+# Which provider actually served the most recent live fetch. Surfaced in the
+# UI so a demo never silently shows fallback data as if it were the broker's.
+RUNTIME_SOURCE = {"bars": None, "news": None, "quote": None}
+
 
 # --------------------------------------------------------------------------
 # Cache
@@ -189,6 +193,86 @@ def synthetic_news(symbol, limit=5, inject=False):
 # --------------------------------------------------------------------------
 # Bars
 # --------------------------------------------------------------------------
+def alpaca_headers():
+    return {
+        "APCA-API-KEY-ID": config.ALPACA_KEY_ID,
+        "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY,
+        "accept": "application/json",
+    }
+
+
+def alpaca_configured():
+    return bool(config.ALPACA_KEY_ID and config.ALPACA_SECRET_KEY)
+
+
+# How far back to reach for a given timeframe so `limit` bars actually come
+# back. Alpaca pages by date, not by count, so asking for 250 daily bars
+# without a start date silently returns whatever fits the default window.
+_ALPACA_LOOKBACK = {
+    "5Min": timedelta(days=7),
+    "15Min": timedelta(days=30),
+    "1Hour": timedelta(days=120),
+    "1Day": timedelta(days=730),
+    "1Week": timedelta(days=2000),
+}
+
+
+def _fetch_alpaca_bars(symbol, timeframe, limit):
+    if not alpaca_configured():
+        raise RuntimeError("Alpaca credentials not configured")
+
+    tf = timeframe if timeframe in _ALPACA_LOOKBACK else "1Day"
+    intraday = tf in ("5Min", "15Min", "1Hour")
+    start = datetime.now(timezone.utc) - _ALPACA_LOOKBACK[tf]
+
+    params = {
+        "timeframe": tf,
+        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": min(max(limit, 1), 10000),
+        "adjustment": "split",
+        "feed": config.ALPACA_FEED,
+        "sort": "asc",
+    }
+    r = requests.get(f"{config.ALPACA_DATA_URL}/stocks/{symbol}/bars",
+                     headers=alpaca_headers(), params=params,
+                     timeout=config.HTTP_TIMEOUT)
+    if r.status_code == 403:
+        raise RuntimeError(f"Alpaca rejected the '{config.ALPACA_FEED}' feed "
+                           "(subscription does not cover it)")
+    r.raise_for_status()
+    payload = r.json().get("bars") or []
+    if not payload:
+        raise ValueError(f"Alpaca returned no bars for {symbol}")
+
+    out = []
+    for b in payload:
+        dt = datetime.fromisoformat(b["t"].replace("Z", "+00:00"))
+        out.append({
+            # Lightweight Charts wants Unix seconds intraday and date strings
+            # for daily/weekly, same convention as the Yahoo path below.
+            "time": int(dt.timestamp()) if intraday else dt.strftime("%Y-%m-%d"),
+            "open": round(b["o"], 2), "high": round(b["h"], 2),
+            "low": round(b["l"], 2), "close": round(b["c"], 2),
+            "volume": b.get("v", 0),
+        })
+    return out[-limit:]
+
+
+def _fetch_alpaca_quote(symbol):
+    """Latest trade price. More current than the last candle's close."""
+    if not alpaca_configured():
+        raise RuntimeError("Alpaca credentials not configured")
+    r = requests.get(f"{config.ALPACA_DATA_URL}/stocks/{symbol}/trades/latest",
+                     headers=alpaca_headers(),
+                     params={"feed": config.ALPACA_FEED},
+                     timeout=config.HTTP_TIMEOUT)
+    r.raise_for_status()
+    price = (r.json().get("trade") or {}).get("p")
+    if not price:
+        raise ValueError(f"No latest trade for {symbol}")
+    return float(price)
+
+
 def _fetch_yahoo_bars(symbol, timeframe, limit):
     intervals = {
         "5Min": ("5m", "5d"),
@@ -247,11 +331,23 @@ def get_bars(symbol, timeframe="1Day", limit=250, force_refresh=False):
     if synthetic:
         bars = synthetic_bars(symbol, timeframe, limit, scenario)
     else:
-        ok, res = with_retry(lambda: _fetch_yahoo_bars(symbol, timeframe, limit),
-                             label=f"yahoo:{symbol}")
-        if not ok:
-            return []
-        bars = res
+        # Alpaca is the source of record: it is the same venue the orders go
+        # to, so the price the agent reasons about matches the price it trades
+        # against. Yahoo stays wired as a fallback for when the market-data
+        # subscription or the key is unavailable.
+        bars, source = [], None
+        if alpaca_configured():
+            ok, res = with_retry(lambda: _fetch_alpaca_bars(symbol, timeframe, limit),
+                                 label=f"alpaca:bars:{symbol}")
+            if ok:
+                bars, source = res, "alpaca"
+        if not bars:
+            ok, res = with_retry(lambda: _fetch_yahoo_bars(symbol, timeframe, limit),
+                                 label=f"yahoo:{symbol}")
+            if not ok:
+                return []
+            bars, source = res, "yahoo"
+        RUNTIME_SOURCE["bars"] = source
 
     closes = [b["close"] for b in bars]
     ema20 = indicators.ema_list(closes, 20)
@@ -273,12 +369,31 @@ def get_latest_quote(symbol, force_refresh=False):
     # its quote aligned to the displayed daily source of truth.
     if config.RUNTIME.get("synthetic_mode"):
         bars = get_bars(symbol, limit=250, force_refresh=force_refresh)
-    else:
-        bars = get_bars(symbol, timeframe="5Min", limit=2, force_refresh=force_refresh)
-        if not bars:
-            bars = get_bars(symbol, limit=250, force_refresh=force_refresh)
+        price = bars[-1]["close"] if bars else 0.0
+        result = {"symbol": symbol, "price": round(price, 2),
+                  "stale": not bars, "source": "synthetic"}
+        cache_set(key, result, ttl=15)
+        return result
+
+    # Alpaca's latest-trade endpoint is the freshest number available and is
+    # the venue the order will actually fill on.
+    if alpaca_configured():
+        ok, res = with_retry(lambda: _fetch_alpaca_quote(symbol),
+                             attempts=2, label=f"alpaca:quote:{symbol}")
+        if ok:
+            RUNTIME_SOURCE["quote"] = "alpaca"
+            result = {"symbol": symbol, "price": round(res, 2),
+                      "stale": False, "source": "alpaca"}
+            cache_set(key, result, ttl=15)
+            return result
+
+    bars = get_bars(symbol, timeframe="5Min", limit=2, force_refresh=force_refresh)
+    if not bars:
+        bars = get_bars(symbol, limit=250, force_refresh=force_refresh)
     price = bars[-1]["close"] if bars else 0.0
-    result = {"symbol": symbol, "price": round(price, 2), "stale": not bars}
+    RUNTIME_SOURCE["quote"] = RUNTIME_SOURCE.get("bars")
+    result = {"symbol": symbol, "price": round(price, 2), "stale": not bars,
+              "source": RUNTIME_SOURCE.get("bars")}
     cache_set(key, result, ttl=15)
     return result
 
@@ -299,6 +414,42 @@ def data_age_days(bars):
 # --------------------------------------------------------------------------
 # News (untrusted input)
 # --------------------------------------------------------------------------
+def _fetch_alpaca_news(symbol, limit):
+    """
+    Alpaca's news feed (Benzinga). Structured JSON rather than scraped RSS, and
+    it carries the symbol tags, so an item about NVDA that merely mentions AAPL
+    does not get filed under AAPL.
+    """
+    if not alpaca_configured():
+        raise RuntimeError("Alpaca credentials not configured")
+
+    params = {"limit": min(max(limit, 1), 50), "sort": "desc",
+              "include_content": "false", "exclude_contentless": "true"}
+    if symbol:
+        params["symbols"] = symbol
+
+    r = requests.get(config.ALPACA_NEWS_URL, headers=alpaca_headers(),
+                     params=params, timeout=config.HTTP_TIMEOUT)
+    r.raise_for_status()
+    payload = r.json().get("news") or []
+    if not payload:
+        raise ValueError("Alpaca news feed empty")
+
+    items = []
+    for n in payload[:limit]:
+        items.append({
+            "title": n.get("headline", ""),
+            "link": n.get("url", ""),
+            # Summary is untrusted text like any other; it gets screened below.
+            "summary": re.sub("<[^<]+?>", "", n.get("summary", ""))[:200],
+            "source": n.get("source", "alpaca"),
+            "published": n.get("created_at", ""),
+            "symbols": n.get("symbols", []),
+            "sentiment": "NEUTRAL",
+        })
+    return items
+
+
 def _fetch_rss(symbol, limit):
     import feedparser
     feed_url = (
@@ -337,8 +488,17 @@ def get_news(symbol=None, limit=6, sentiment_fn=None, inject_demo=False):
     if synthetic:
         raw = synthetic_news(symbol or "SPY", limit, inject=inject_demo)
     else:
-        ok, res = with_retry(lambda: _fetch_rss(symbol, limit), label=f"rss:{symbol}")
-        raw = res if ok else []
+        raw, source = [], None
+        if alpaca_configured():
+            ok, res = with_retry(lambda: _fetch_alpaca_news(symbol, limit),
+                                 label=f"alpaca:news:{symbol}")
+            if ok:
+                raw, source = res, "alpaca"
+        if not raw:
+            ok, res = with_retry(lambda: _fetch_rss(symbol, limit),
+                                 label=f"rss:{symbol}")
+            raw, source = (res, "yahoo") if ok else ([], None)
+        RUNTIME_SOURCE["news"] = source
         if inject_demo and raw:
             raw.insert(1, {
                 "title": INJECTION_DEMO_HEADLINE,
