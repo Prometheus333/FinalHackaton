@@ -25,7 +25,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain.globals import set_llm_cache
-from langchain.cache import InMemoryCache
+from langchain_community.cache import InMemoryCache
 import urllib3
 import warnings
 
@@ -104,6 +104,119 @@ def _ema_list(values, period):
     for i in range(1, len(values)):
         out.append((values[i] - out[-1]) * k + out[-1])
     return out
+
+def _sma_list(values, period):
+    out = []
+    for i in range(len(values)):
+        if i < period - 1:
+            out.append(None)
+        else:
+            window = values[i - period + 1:i + 1]
+            out.append(sum(window) / period)
+    return out
+
+def _stddev_list(values, period):
+    out = []
+    for i in range(len(values)):
+        if i < period - 1:
+            out.append(None)
+        else:
+            window = values[i - period + 1:i + 1]
+            mean = sum(window) / period
+            var = sum((x - mean) ** 2 for x in window) / period
+            out.append(var ** 0.5)
+    return out
+
+def _rsi_list(values, period=14):
+    n = len(values)
+    out = [None] * n
+    if n <= period:
+        return out
+    gains = [0.0] * (n - 1)
+    losses = [0.0] * (n - 1)
+    for i in range(1, n):
+        change = values[i] - values[i - 1]
+        gains[i - 1] = max(change, 0)
+        losses[i - 1] = max(-change, 0)
+
+    def _rsi_from(avg_gain, avg_loss):
+        if avg_loss == 0: return 100.0
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    out[period] = _rsi_from(avg_gain, avg_loss)
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        out[i + 1] = _rsi_from(avg_gain, avg_loss)
+    return out
+
+def _vwap_list(bars):
+    out = []
+    cum_pv = 0.0
+    cum_vol = 0.0
+    for b in bars:
+        typical = (b["high"] + b["low"] + b["close"]) / 3
+        vol = b.get("volume") or 0
+        cum_pv += typical * vol
+        cum_vol += vol
+        out.append(round(cum_pv / cum_vol, 2) if cum_vol else b["close"])
+    return out
+
+def compute_indicators(bars):
+    """Devuelve series listas para graficar: SMA20/50, EMA12, Bandas de Bollinger 20/2, VWAP, RSI14 y volumen."""
+    if not bars: return {}
+    closes = [b["close"] for b in bars]
+    times = [b["time"] for b in bars]
+
+    sma20 = _sma_list(closes, 20)
+    sma50 = _sma_list(closes, 50)
+    ema12 = _ema_list(closes, 12)
+    std20 = _stddev_list(closes, 20)
+    bb_upper = [round(m + 2 * s, 2) if (m is not None and s is not None) else None for m, s in zip(sma20, std20)]
+    bb_lower = [round(m - 2 * s, 2) if (m is not None and s is not None) else None for m, s in zip(sma20, std20)]
+    vwap = _vwap_list(bars)
+    rsi14 = _rsi_list(closes, 14)
+
+    def series(values):
+        return [{"time": t, "value": round(v, 2)} for t, v in zip(times, values) if v is not None]
+
+    return {
+        "sma20": series(sma20),
+        "sma50": series(sma50),
+        "ema12": series(ema12),
+        "bb_upper": series(bb_upper),
+        "bb_middle": series(sma20),
+        "bb_lower": series(bb_lower),
+        "vwap": series(vwap),
+        "rsi14": series(rsi14),
+        "volume": [
+            {"time": b["time"], "value": b.get("volume") or 0,
+             "color": "#10b98166" if b["close"] >= b["open"] else "#ef444466"}
+            for b in bars
+        ],
+    }
+
+def compute_levels(bars):
+    """Soporte/resistencia y niveles de retroceso de Fibonacci sobre el rango de velas cargado."""
+    if not bars: return {}
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    swing_high = max(highs)
+    swing_low = min(lows)
+    diff = swing_high - swing_low
+    fib = {
+        "0.0": round(swing_high, 2),
+        "0.236": round(swing_high - diff * 0.236, 2),
+        "0.382": round(swing_high - diff * 0.382, 2),
+        "0.5": round(swing_high - diff * 0.5, 2),
+        "0.618": round(swing_high - diff * 0.618, 2),
+        "0.786": round(swing_high - diff * 0.786, 2),
+        "1.0": round(swing_low, 2),
+    }
+    return {"support": round(swing_low, 2), "resistance": round(swing_high, 2), "fibonacci": fib}
 
 def get_bars(symbol, timeframe="1Day", limit=250):
     cache_key = f"bars:{symbol}:{timeframe}:{limit}"
@@ -277,6 +390,82 @@ def generate_ai_recommendation(symbol, timeframe="1Day"):
     cache_set(cache_key, data, ttl_override=120)
     return data
 
+def generate_strategy(symbol, timeframe="1Day"):
+    """
+    Genera una estrategia de entrada/salida para un símbolo:
+    - señal BUY / SELL / HOLD
+    - precio de entrada, stop-loss (escenario negativo) y take-profit (escenario positivo)
+    - relación riesgo/beneficio
+    - narrativa de ambos escenarios
+    """
+    cache_key = f"strategy:{symbol}:{timeframe}"
+    cached = cache_get(cache_key)
+    if cached: return cached
+
+    bars = get_bars(symbol, timeframe=timeframe, limit=60)
+    if not bars or len(bars) < 10:
+        return {"signal": "N/A", "error": "Datos insuficientes para generar una estrategia."}
+
+    closes = [b["close"] for b in bars]
+    last_close = closes[-1]
+    last_time = bars[-1]["time"]
+
+    lookback = bars[-20:] if len(bars) >= 20 else bars
+    swing_high = max(b["high"] for b in lookback)
+    swing_low = min(b["low"] for b in lookback)
+
+    ema20_series = _ema_list(closes, 20)
+    ema20 = ema20_series[-1] if ema20_series else last_close
+    ref_idx = -10 if len(closes) >= 10 else 0
+    momentum = last_close / (closes[ref_idx] if closes[ref_idx] else last_close)
+
+    if momentum > 1.015 and last_close > ema20:
+        signal = "BUY"
+    elif momentum < 0.985 and last_close < ema20:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
+
+    risk_pct = 0.03
+    reward_ratio = 2.0
+    entry = round(last_close, 2)
+
+    if signal == "BUY":
+        stop = round(min(swing_low, entry * (1 - risk_pct)), 2)
+        risk = max(entry - stop, 0.01)
+        target = round(entry + risk * reward_ratio, 2)
+        positive = f"Si el precio se mantiene sobre la entrada de ${entry}, el impulso alcista podria llevarlo hacia el objetivo de ${target}."
+        negative = f"Si el precio rompe por debajo del soporte de ${stop}, se invalida la idea de compra; conviene salir para limitar la perdida."
+    elif signal == "SELL":
+        stop = round(max(swing_high, entry * (1 + risk_pct)), 2)
+        risk = max(stop - entry, 0.01)
+        target = round(entry - risk * reward_ratio, 2)
+        positive = f"Si el precio se mantiene bajo la entrada de ${entry}, la presion bajista podria llevarlo hacia ${target}."
+        negative = f"Si el precio rompe por encima de la resistencia de ${stop}, se invalida la idea bajista; conviene salir para limitar la perdida."
+    else:
+        stop = round(swing_low, 2)
+        target = round(swing_high, 2)
+        risk = max(entry - stop, 0.01)
+        positive = f"Mientras se mantenga por encima de ${stop}, el sesgo sigue siendo neutral a favorable; vigilar ruptura por encima de ${target}."
+        negative = f"Una ruptura por debajo de ${stop} cambiaria el sesgo a bajista; no hay señal clara de entrada por ahora."
+
+    rr = round(abs(target - entry) / risk, 2) if risk else None
+
+    data = {
+        "symbol": symbol,
+        "signal": signal,
+        "entry": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "risk_reward": rr,
+        "entry_time": last_time,
+        "positive_scenario": positive,
+        "negative_scenario": negative,
+        "rationale": f"Estrategia basada en momentum de {len(bars)} periodos ({timeframe}), EMA20 (${round(ema20, 2)}) y rango de soporte/resistencia de las ultimas {len(lookback)} velas.",
+    }
+    cache_set(cache_key, data, ttl_override=120)
+    return data
+
 # --------------------------------------------------------------------------
 # Routes — API
 # --------------------------------------------------------------------------
@@ -289,7 +478,13 @@ def api_search():
 @app.route("/api/bars/<symbol>")
 def api_bars(symbol):
     tf = request.args.get("timeframe", "1Day")
-    return jsonify({"symbol": symbol.upper(), "bars": get_bars(symbol.upper(), tf, 250)})
+    bars = get_bars(symbol.upper(), tf, 250)
+    return jsonify({
+        "symbol": symbol.upper(),
+        "bars": bars,
+        "indicators": compute_indicators(bars),
+        "levels": compute_levels(bars),
+    })
 
 @app.route("/api/quotes")
 def api_quotes():
@@ -299,6 +494,10 @@ def api_quotes():
 @app.route("/api/recommend/<symbol>")
 def api_recommend(symbol):
     return jsonify(generate_ai_recommendation(symbol.upper(), request.args.get("timeframe", "1Day")))
+
+@app.route("/api/strategy/<symbol>")
+def api_strategy(symbol):
+    return jsonify(generate_strategy(symbol.upper(), request.args.get("timeframe", "1Day")))
 
 @app.route("/api/news")
 def api_news_endpoint():
@@ -386,6 +585,9 @@ INDEX_HTML = """<!DOCTYPE html>
   .tf-btn { padding: 2px 8px; border: 1px solid var(--border); font-size: 10px; cursor: pointer; background: transparent; color: #9ca3af; }
   .tf-btn.active { background: #10b981; color: black; font-weight: bold; border-color: #10b981; }
 
+  .ind-btn { padding: 2px 7px; border: 1px solid var(--border); font-size: 9px; cursor: pointer; background: transparent; color: #9ca3af; white-space: nowrap; }
+  .ind-btn.active { background: #1e293b; color: #34d399; border-color: #10b981; font-weight: bold; }
+
   /* Professional Toast Notifications */
   #toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
   .toast { background: #050505; border-left: 4px solid var(--accent); padding: 12px 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.8); color: #d1d5db; min-width: 280px; font-family: ui-monospace, monospace; animation: slideIn 0.3s ease-out forwards; }
@@ -468,9 +670,30 @@ INDEX_HTML = """<!DOCTYPE html>
             <input id="tradeQty" type="number" min="1" value="1" class="w-14 bg-black border border-[var(--border)] text-white text-center py-1 text-xs focus:outline-none focus:border-emerald-400">
             <button onclick="executeOrder('buy')" class="bg-emerald-600 hover:bg-emerald-500 text-black font-bold px-4 py-1 text-xs">BUY</button>
             <button onclick="executeOrder('sell')" class="bg-red-600 hover:bg-red-500 text-white font-bold px-4 py-1 text-xs">SELL</button>
+            <button id="strategyBtn" onclick="runStrategy()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-1 text-xs">📊 ESTRATEGIA</button>
           </div>
         </div>
+        <div id="strategyPanel" class="hidden absolute top-14 right-4 z-30 w-72 panel border border-blue-800 p-3 glow"></div>
+
+        <div class="flex flex-wrap items-center gap-1 mb-1 shrink-0 bg-black p-1.5 border border-[var(--border)] relative z-20">
+          <span class="text-[9px] text-gray-500 uppercase mr-1">Indicadores:</span>
+          <button class="ind-btn" data-ind="sma20">SMA 20</button>
+          <button class="ind-btn" data-ind="sma50">SMA 50</button>
+          <button class="ind-btn" data-ind="ema12">EMA 12</button>
+          <button class="ind-btn" data-ind="bb">Bollinger 20/2</button>
+          <button class="ind-btn" data-ind="vwap">VWAP</button>
+          <button class="ind-btn" data-ind="volume">Volumen</button>
+          <button class="ind-btn" data-ind="rsi">RSI 14</button>
+          <button class="ind-btn" data-ind="fib">Fibonacci</button>
+          <button class="ind-btn" data-ind="sr">Soporte/Resistencia</button>
+          <button class="ind-btn" data-ind="log">Escala Log</button>
+        </div>
+
         <div id="chart" class="flex-1 min-h-0 relative z-0"></div>
+        <div id="rsiPanel" class="hidden h-[70px] shrink-0 border-t border-[var(--border)] mt-1 pt-1">
+          <div class="flex justify-between text-[9px] text-gray-500 px-1"><span>RSI (14)</span><span id="rsiValue">—</span></div>
+          <div id="rsiChart" class="w-full h-[52px]"></div>
+        </div>
       </section>
 
       <!-- BOTTOM: News and Agent Chat Split -->
@@ -513,6 +736,23 @@ let activeTimeframe = "1Day";
 
 let chart, candleSeries;
 let extraSeries = [];
+let strategyLines = [];
+
+let indicatorState = { sma20:false, sma50:false, ema12:false, bb:false, vwap:false, volume:false, rsi:false, fib:false, sr:false, log:false };
+let indicatorSeries = {};
+let volumeSeries = null;
+let fibLines = [];
+let srLines = [];
+let lastIndicatorsData = {};
+let lastLevelsData = {};
+let rsiChart, rsiSeries;
+
+function clearStrategy() {
+  strategyLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e) {} });
+  strategyLines = [];
+  candleSeries.setMarkers([]);
+  document.getElementById('strategyPanel').classList.add('hidden');
+}
 
 function initChart() {
   chart = LightweightCharts.createChart(document.getElementById('chart'), {
@@ -521,6 +761,24 @@ function initChart() {
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
   });
   candleSeries = chart.addCandlestickSeries({ upColor: '#10b981', downColor: '#ef4444', borderVisible: false, wickUpColor: '#10b981', wickDownColor: '#ef4444' });
+
+  chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (range && rsiChart) { try { rsiChart.timeScale().setVisibleLogicalRange(range); } catch(e) {} }
+  });
+}
+
+function initRsiChart() {
+  rsiChart = LightweightCharts.createChart(document.getElementById('rsiChart'), {
+    layout: { background: { color: 'transparent' }, textColor: '#9fb3c8' },
+    grid: { vertLines: { color: '#111827' }, horzLines: { color: '#111827' } },
+    rightPriceScale: { visible: true, borderVisible: false },
+    timeScale: { visible: false, borderVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    handleScroll: false, handleScale: false,
+  });
+  rsiSeries = rsiChart.addLineSeries({ color: '#a78bfa', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false });
+  rsiSeries.createPriceLine({ price: 70, color: '#ef444488', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: '70' });
+  rsiSeries.createPriceLine({ price: 30, color: '#10b98188', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: '30' });
 }
 
 function clearExtraSeries() { extraSeries.forEach(s => chart.removeSeries(s)); extraSeries = []; }
@@ -531,6 +789,136 @@ function addDashedSeries(points, color) {
   });
   series.setData(points); extraSeries.push(series);
 }
+
+function ensureVolumeSeries() {
+  if (!volumeSeries) {
+    volumeSeries = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'vol', lastValueVisible: false, priceLineVisible: false });
+    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  }
+  return volumeSeries;
+}
+
+function toggleLine(key, data, color, on) {
+  if (on) {
+    if (indicatorSeries[key]) return;
+    const s = chart.addLineSeries({ color, lineWidth: 1.5, priceLineVisible: false, lastValueVisible: true });
+    s.setData(data || []);
+    indicatorSeries[key] = s;
+  } else if (indicatorSeries[key]) {
+    chart.removeSeries(indicatorSeries[key]);
+    delete indicatorSeries[key];
+  }
+}
+
+function toggleBollinger(on) {
+  if (on) {
+    if (indicatorSeries.bb) return;
+    const upper = chart.addLineSeries({ color: '#818cf8', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    const mid = chart.addLineSeries({ color: '#818cf880', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false });
+    const lower = chart.addLineSeries({ color: '#818cf8', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    upper.setData(lastIndicatorsData.bb_upper || []);
+    mid.setData(lastIndicatorsData.bb_middle || []);
+    lower.setData(lastIndicatorsData.bb_lower || []);
+    indicatorSeries.bb = [upper, mid, lower];
+  } else if (indicatorSeries.bb) {
+    indicatorSeries.bb.forEach(s => chart.removeSeries(s));
+    delete indicatorSeries.bb;
+  }
+}
+
+function toggleVolume(on) {
+  if (on) {
+    const s = ensureVolumeSeries();
+    s.setData(lastIndicatorsData.volume || []);
+  } else if (volumeSeries) {
+    chart.removeSeries(volumeSeries);
+    volumeSeries = null;
+  }
+}
+
+function toggleRsi(on) {
+  const panel = document.getElementById('rsiPanel');
+  if (on) {
+    panel.classList.remove('hidden');
+    rsiSeries.setData(lastIndicatorsData.rsi14 || []);
+    const rsiVals = lastIndicatorsData.rsi14 || [];
+    document.getElementById('rsiValue').textContent = rsiVals.length ? rsiVals[rsiVals.length - 1].value.toFixed(1) : '—';
+    setTimeout(() => {
+      const range = chart.timeScale().getVisibleLogicalRange();
+      if (range) rsiChart.timeScale().setVisibleLogicalRange(range);
+    }, 0);
+  } else {
+    panel.classList.add('hidden');
+  }
+}
+
+function toggleFib(on) {
+  if (on) {
+    if (!lastLevelsData.fibonacci) return;
+    Object.entries(lastLevelsData.fibonacci).forEach(([level, price]) => {
+      fibLines.push(candleSeries.createPriceLine({
+        price, color: '#eab308', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
+        axisLabelVisible: true, title: `Fib ${level}`
+      }));
+    });
+  } else {
+    fibLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e) {} });
+    fibLines = [];
+  }
+}
+
+function toggleSr(on) {
+  if (on) {
+    if (!lastLevelsData.resistance) return;
+    srLines.push(candleSeries.createPriceLine({ price: lastLevelsData.resistance, color: '#ef4444', lineWidth: 2, axisLabelVisible: true, title: 'Resistencia' }));
+    srLines.push(candleSeries.createPriceLine({ price: lastLevelsData.support, color: '#10b981', lineWidth: 2, axisLabelVisible: true, title: 'Soporte' }));
+  } else {
+    srLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e) {} });
+    srLines = [];
+  }
+}
+
+function toggleLog(on) {
+  chart.priceScale('right').applyOptions({ mode: on ? LightweightCharts.PriceScaleMode.Logarithmic : LightweightCharts.PriceScaleMode.Normal });
+}
+
+function applyIndicator(key, on) {
+  if (key === 'sma20') toggleLine('sma20', lastIndicatorsData.sma20, '#60a5fa', on);
+  else if (key === 'sma50') toggleLine('sma50', lastIndicatorsData.sma50, '#f59e0b', on);
+  else if (key === 'ema12') toggleLine('ema12', lastIndicatorsData.ema12, '#f472b6', on);
+  else if (key === 'bb') toggleBollinger(on);
+  else if (key === 'vwap') toggleLine('vwap', lastIndicatorsData.vwap, '#22d3ee', on);
+  else if (key === 'volume') toggleVolume(on);
+  else if (key === 'rsi') toggleRsi(on);
+  else if (key === 'fib') toggleFib(on);
+  else if (key === 'sr') toggleSr(on);
+  else if (key === 'log') toggleLog(on);
+}
+
+function refreshActiveIndicators() {
+  Object.keys(indicatorSeries).forEach(key => {
+    const val = indicatorSeries[key];
+    if (Array.isArray(val)) val.forEach(s => chart.removeSeries(s));
+    else chart.removeSeries(val);
+  });
+  indicatorSeries = {};
+  if (volumeSeries) { chart.removeSeries(volumeSeries); volumeSeries = null; }
+  fibLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e) {} }); fibLines = [];
+  srLines.forEach(l => { try { candleSeries.removePriceLine(l); } catch(e) {} }); srLines = [];
+
+  Object.entries(indicatorState).forEach(([key, on]) => {
+    if (on && key !== 'log') applyIndicator(key, true);
+  });
+}
+
+document.querySelectorAll('.ind-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const key = btn.dataset.ind;
+    indicatorState[key] = !indicatorState[key];
+    btn.classList.toggle('active', indicatorState[key]);
+    applyIndicator(key, indicatorState[key]);
+  });
+});
 
 function highlightWatchlist() {
   document.querySelectorAll('.watch-item').forEach(el => {
@@ -552,6 +940,7 @@ async function loadSymbol(sym, timeframe = null) {
   activeSymbol = sym;
   if(timeframe) activeTimeframe = timeframe;
   document.getElementById('activeSymbol').textContent = sym;
+  clearStrategy();
   
   document.querySelectorAll('.tf-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tf === activeTimeframe));
   highlightWatchlist();
@@ -574,6 +963,10 @@ async function loadSymbol(sym, timeframe = null) {
     document.getElementById('activePrice').textContent = "N/A";
     chartErrorDiv.classList.remove('hidden');
   }
+
+  lastIndicatorsData = data.indicators || {};
+  lastLevelsData = data.levels || {};
+  refreshActiveIndicators();
 
   document.getElementById('aiStrip').classList.remove('hidden');
   document.getElementById('aiBadge').className = 'badge bg-gray-600';
@@ -767,6 +1160,69 @@ async function refreshNews(symbol) {
   });
 }
 
+async function runStrategy() {
+  const btn = document.getElementById('strategyBtn');
+  const original = btn.textContent;
+  btn.textContent = 'ANALIZANDO...';
+  btn.disabled = true;
+  clearStrategy();
+
+  try {
+    const res = await fetch(`/api/strategy/${activeSymbol}?timeframe=${activeTimeframe}`);
+    const s = await res.json();
+
+    if (s.error) { showToast('ESTRATEGIA', s.error, 'error'); return; }
+
+    // Líneas horizontales: entrada, take-profit (positivo), stop-loss (negativo)
+    strategyLines.push(candleSeries.createPriceLine({
+      price: s.entry, color: '#3b82f6', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid,
+      axisLabelVisible: true, title: `ENTRADA ${s.entry}`
+    }));
+    strategyLines.push(candleSeries.createPriceLine({
+      price: s.take_profit, color: '#10b981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true, title: `TP (+) ${s.take_profit}`
+    }));
+    strategyLines.push(candleSeries.createPriceLine({
+      price: s.stop_loss, color: '#ef4444', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true, title: `SL (-) ${s.stop_loss}`
+    }));
+
+    // Flecha de señal sobre la última vela
+    const color = s.signal === 'BUY' ? '#10b981' : (s.signal === 'SELL' ? '#ef4444' : '#9ca3af');
+    const shape = s.signal === 'BUY' ? 'arrowUp' : (s.signal === 'SELL' ? 'arrowDown' : 'circle');
+    const position = s.signal === 'SELL' ? 'aboveBar' : 'belowBar';
+    candleSeries.setMarkers([{ time: s.entry_time, position, color, shape, text: s.signal }]);
+
+    showStrategyPanel(s);
+  } catch (e) {
+    showToast('ESTRATEGIA', 'No se pudo generar la estrategia. Revisa la conexión.', 'error');
+  } finally {
+    btn.textContent = original;
+    btn.disabled = false;
+  }
+}
+
+function showStrategyPanel(s) {
+  const panel = document.getElementById('strategyPanel');
+  const badgeClass = s.signal === 'BUY' ? 'bg-buy' : (s.signal === 'SELL' ? 'bg-sell' : 'bg-hold');
+  panel.innerHTML = `
+    <div class="flex items-center justify-between mb-2">
+      <span class="badge ${badgeClass}">${s.signal}</span>
+      <span class="text-[9px] text-gray-500">R:R ${s.risk_reward ?? '—'}</span>
+      <button onclick="clearStrategy()" class="text-gray-500 hover:text-white text-sm leading-none">×</button>
+    </div>
+    <div class="grid grid-cols-3 gap-1 text-center text-[9px] mb-2">
+      <div><div class="text-gray-500">ENTRADA</div><div class="text-blue-400 font-bold">${s.entry}</div></div>
+      <div><div class="text-gray-500">TP (+)</div><div class="text-emerald-400 font-bold">${s.take_profit}</div></div>
+      <div><div class="text-gray-500">SL (-)</div><div class="text-red-400 font-bold">${s.stop_loss}</div></div>
+    </div>
+    <div class="text-[9px] text-gray-400 mb-2 leading-snug">${s.rationale}</div>
+    <div class="text-[9px] text-emerald-300 mb-1 leading-snug">▲ ${s.positive_scenario}</div>
+    <div class="text-[9px] text-red-300 leading-snug">▼ ${s.negative_scenario}</div>
+  `;
+  panel.classList.remove('hidden');
+}
+
 function appendChat(role, text) {
   const box = document.getElementById('chatMessages');
   const div = document.createElement('div');
@@ -795,6 +1251,7 @@ document.getElementById('chatForm').addEventListener('submit', async (e) => {
 });
 
 initChart();
+initRsiChart();
 loadSymbol(activeSymbol, "1Day");
 updateWatchlistUI();
 fetchPortfolio();
@@ -812,4 +1269,3 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
-    
