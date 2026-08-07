@@ -1,0 +1,76 @@
+AI Friday Season 2 – Regional Finale
+
+Use the following checklist as applicable while solving the selected problem statement.
+
+USER EXPERIENCE AND INTERFACE
+
+Design an intuitive interface aligned to the target workflow, user journey, context, tone, and accessibility needs.
+
+Use conversation, visualization, or a hybrid experience where it improves clarity, personalization, and speed of action.
+
+DATA ARCHITECTURE AND PROCESSING
+
+Use relevant, high-quality, anonymized or synthetic data with clear preprocessing, retrieval, aggregation, and correlation methods.
+
+Choose suitable storage for structured and unstructured data, ensuring consistency across sources, generated datasets, and downstream outputs.
+
+CORE AI SOLUTION DESIGN AND AGENTIC ARCHITECTURE
+
+Define the agentic design pattern, agent roles, collaboration model, handoffs, tool usage, retry, reflection, and escalation logic.
+
+Balance autonomy with human approval checkpoints, intervention points, and clear boundaries for high-risk or uncertain decisions.
+
+Ground outputs in trusted sources, cite evidence where useful, separate facts from assumptions, and explain reasoning, confidence, limits, and trade-offs.
+
+Build responsible AI guardrails for privacy, bias, explainability, prompt injection, unsafe recommendations, unauthorized tool execution, and regulated decisions.
+
+TECHNICAL IMPLEMENTATION
+
+Use a modular, scalable architecture that clearly separates AI layers, enterprise systems, knowledge stores, APIs, tools, and external feeds.
+
+Define context engineering across memory, caching, retrieval, prompts, context windows, token usage, latency, cost, and privacy.
+
+Maintain configurability across models, prompts, tools, APIs, vector stores, and deployment environments to avoid lock-in.
+
+Cover security, identity, permissions, secrets, data retention, audit logging, access governance, and misuse monitoring.
+
+TESTING AND QUALITY ASSURANCE
+
+Evaluate beyond demo success: accuracy, groundedness, hallucination control, latency, cost, reliability, traceability, safety, and user trust.
+
+Use varied test data, edge cases, failure scenarios, expected outputs, scoring criteria, and automated checks where practical.
+
+Validate robustness, accuracy, and reliability across key use-case conditions and user journeys.
+
+DEMO READINESS
+
+Prepare realistic demo flows using quality input data, edge cases, failure paths, and expected outcomes.
+
+Show how AI, GenAI, or Agentic AI improves the solution versus a conventional approach in speed, scale, quality, reliability, or personalization.
+
+Clearly explain business value, adoption path, measurable outcomes, design choices, alternatives, trade-offs, and prototype-to-enterprise readiness.
+
+Walk through problem breakdown, data preparation, architecture, agent roles, prompts, tools, evaluation approach, code flow, and AI-assisted code generation.
+
+TCS Internal 5 August 2026
+
+
+
+TCS Internal 5 August 2026
+
+AI Friday Season 2 – Regional Finale
+
+Capital Markets Algorithmic Trading Strategy Advisor Agent
+
+PROBLEM STATEMENT
+Traders require rapid evaluation and adaptation of algorithmic trading strategies based on market conditions, historical performance, and risk profiles. Manual strategy tuning is complex and time-consuming, limiting responsiveness to market changes. Existing tools lack integrated AI capabilities for multi-agent collaboration in backtesting, risk assessment, and strategy recommendation. An intelligent agent that integrates market data, trading APIs, and historical performance can support traders in optimizing algorithmic strategies effectively.
+
+Data Considerations:
+Market data streams (tick, OHLCV) from financial APIs; historical trade and strategy performance records; trading platform APIs for order execution; moderate to high data volume; preprocessing includes data normalization and feature extraction; compliance with market data licensing; synthetic strategy datasets for development.
+
+Consider using synthetic or anonymized data where appropriate. Ensure data quality and relevance to the problem context.
+
+SOLUTION EXPECTATIONS
+A multi-agent AI system with agents for data ingestion, backtesting simulations, risk scoring, and strategy recommendation. Features include a trader dashboard with performance charts, risk metrics, and suggested strategy adjustments. Integrations with trading APIs enable simulated or live strategy execution. Success metrics include recommendation accuracy, backtest performance improvements, and user feedback. Demonstrations showcase strategy evaluation workflows, multi-agent orchestration, and robust testing with documentation.
+
+Feel free to explore creative solutions that align with the problem context and objectives.
