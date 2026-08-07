@@ -1,4 +1,4 @@
-# AI Trading Terminal
+# Algorithmic Trading Strategy Advisor
 
 Voice-driven trading terminal: live Alpaca market data, Python-computed
 indicators, an LLM analyst, and a continuous voice call that drives the whole UI.
@@ -104,6 +104,10 @@ absolute positioning, no DOM reordering — two layout calls can never collide.
 | `POST /api/whatif` | Projection points |
 | `POST /api/chat` | LLM analyst: reply + UI commands |
 | `GET /api/indicators/<symbol>?which=` | Technical overlay series and levels |
+| `GET /api/strategy/<symbol>` | Full four-agent pipeline: backtest, risk, recommendation, trace |
+| `GET /api/backtest/<symbol>/<strategy>` | Single strategy backtest |
+| `GET /api/strategies` | Strategy catalogue with theses |
+| `GET /api/audit` | Last 50 pipeline runs |
 | `GET /api/recommendation/<symbol>` | Bias, conviction, signals, news tone, stop/target |
 | `GET /api/briefing?symbols=` | Watchlist scan: only moves >2% and RSI extremes |
 | `POST /api/tts` | ElevenLabs speech (key stays server-side) |
@@ -111,6 +115,15 @@ absolute positioning, no DOM reordering — two layout calls can never collide.
 | `GET /api/stream` | SSE quote stream |
 | `GET /api/voice/mode` | Which voice mode is available |
 | `GET /api/health` | Alpaca, universe size, voice status |
+
+## Testing
+
+```bash
+python eval_harness.py     # 26 automated checks, exits non-zero on failure
+```
+
+See ARCHITECTURE.md for the agent pipeline, honesty guarantees and design
+trade-offs.
 
 ## Known limits
 

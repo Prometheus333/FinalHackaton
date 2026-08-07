@@ -38,6 +38,8 @@ from typing import Any
 
 import feedparser
 import requests
+
+import strategy_engine as se
 import urllib3
 from flask import Flask, Response, jsonify, request, stream_with_context
 
@@ -591,8 +593,6 @@ Valid JSON only:
 Commands (only when they add something; empty is normal):
   {"action":"add_projection","scenario":"base|bull|bear","days":10,"label":"..."}
   {"action":"add_scenario","scenario":"base|bull|bear","days":10,"shock_pct":-8,"label":"Earnings miss"}
-  {"action":"add_overlay","symbol":"MSFT"}
-  {"action":"remove_overlay","symbol":"MSFT"}
   {"action":"set_symbol","symbol":"AAPL"}
   {"action":"search_symbol","query":"nvidia"}
   {"action":"add_watchlist","symbol":"NVDA"}
@@ -730,7 +730,7 @@ def ask_ai(message: str, symbol: str, session_id: str = "default") -> dict:
             if hits:
                 commands.append({"action": "search_results", "query": c.get("query"),
                                  "results": hits})
-        elif a in ("add_overlay", "remove_overlay", "set_symbol", "filter_news",
+        elif a in ("set_symbol", "filter_news",
                    "clear_projections", "load_news", "open_news",
                    "add_watchlist", "remove_watchlist", "focus_panel",
                    "toggle_indicator"):
@@ -1280,6 +1280,197 @@ def api_indicators(symbol):
     tf = request.args.get("timeframe", "1Day")
     bars = get_bars(symbol.upper(), timeframe=tf, limit=250)["bars"]
     return jsonify({"symbol": symbol.upper(), **indicator_series(bars, which)})
+
+
+# --------------------------------------------------------------------------
+# Multi-agent orchestration
+# --------------------------------------------------------------------------
+# Four specialists in a sequential pipeline with explicit handoffs. Each records
+# what it did, how long it took and how confident it is, so the whole chain is
+# auditable after the fact. A step that fails degrades the run instead of
+# killing it: later agents receive the gap and say so.
+_audit: deque = deque(maxlen=200)
+_audit_lock = threading.Lock()
+
+
+def _log_audit(entry: dict):
+    entry["ts"] = datetime.now(timezone.utc).isoformat()
+    with _audit_lock:
+        _audit.append(entry)
+
+
+def strategy_pipeline(symbol: str, timeframe: str = "1Day") -> dict:
+    """DataAgent -> BacktestAgent -> RiskAgent -> StrategyAgent."""
+    run_id = f"{symbol}-{int(time.time())}"
+    trace, t_all = [], time.time()
+
+    def step(agent, role, fn):
+        t0 = time.time()
+        try:
+            out = fn()
+            status, err = "ok", None
+        except Exception as exc:  # noqa: BLE001
+            out, status, err = None, "failed", str(exc)[:160]
+            app.logger.warning("%s failed: %s", agent, exc)
+        trace.append({"agent": agent, "role": role, "status": status,
+                      "ms": int((time.time() - t0) * 1000), "error": err})
+        return out, status
+
+    # 1. Data ---------------------------------------------------------------
+    payload, st = step("DataAgent", "Fetch and validate market data",
+                       lambda: get_bars(symbol, timeframe=timeframe, limit=500))
+    if st != "ok" or not payload or not payload.get("bars"):
+        _log_audit({"run": run_id, "symbol": symbol, "outcome": "aborted", "trace": trace})
+        return {"symbol": symbol, "error": "no market data", "trace": trace}
+
+    bars = payload["bars"]
+    quality = {
+        "bars": len(bars),
+        "source": payload["source"],
+        "stale": bool(payload.get("stale")),
+        "sufficient_for_backtest": len(bars) >= 80,
+    }
+    trace[-1]["output"] = quality
+
+    if payload["source"] == "synthetic":
+        # Guardrail: never let a strategy recommendation ride on invented prices.
+        _log_audit({"run": run_id, "symbol": symbol, "outcome": "blocked_synthetic",
+                    "trace": trace})
+        return {"symbol": symbol, "blocked": True,
+                "reason": "Market data is synthetic. Strategy recommendations are "
+                          "suppressed: a backtest on invented prices is worse than none.",
+                "trace": trace, "data_quality": quality}
+    if not quality["sufficient_for_backtest"]:
+        _log_audit({"run": run_id, "symbol": symbol, "outcome": "insufficient_data",
+                    "trace": trace})
+        return {"symbol": symbol, "blocked": True,
+                "reason": f"Only {len(bars)} bars available; a backtest needs at least 80.",
+                "trace": trace, "data_quality": quality}
+
+    # 2. Backtest -----------------------------------------------------------
+    ranking, st = step("BacktestAgent", "Simulate every strategy over real history",
+                       lambda: se.rank_strategies(bars, symbol))
+    if st != "ok" or not ranking or ranking.get("error"):
+        _log_audit({"run": run_id, "symbol": symbol, "outcome": "backtest_failed",
+                    "trace": trace})
+        return {"symbol": symbol, "error": "backtest failed", "trace": trace}
+    trace[-1]["output"] = {"evaluated": len(ranking["ranking"]),
+                           "regime": ranking["regime"]["regime"],
+                           "top": ranking["recommended"]}
+
+    # 3. Risk ---------------------------------------------------------------
+    def _risk():
+        best = ranking["best_detail"]
+        r = dict(best["risk"])
+        checks = []
+        if best["max_drawdown_pct"] > 35:
+            checks.append("drawdown above 35% — position sizing must compensate")
+        if best["trades"] < 10:
+            checks.append("thin trade sample — result may not generalise")
+        if ranking["confidence_pct"] < 40:
+            checks.append("low confidence — treat as research, not a signal")
+        if payload.get("stale"):
+            checks.append("data is stale — levels are indicative only")
+        r["gate"] = "review_required" if checks else "clear"
+        r["checks"] = checks
+        return r
+
+    risk, st = step("RiskAgent", "Score risk and apply approval gates", _risk)
+    trace[-1]["output"] = {"band": (risk or {}).get("band"), "gate": (risk or {}).get("gate")}
+
+    # 4. Strategy -----------------------------------------------------------
+    def _decide():
+        rec = ranking["recommended"]
+        needs_human = (risk or {}).get("gate") == "review_required"
+        return {
+            "recommended": rec,
+            "label": ranking["recommended_label"],
+            "confidence_pct": ranking["confidence_pct"],
+            "requires_human_approval": needs_human,
+            "action": "propose" if needs_human else "recommend",
+        }
+
+    decision, _ = step("StrategyAgent", "Select a strategy and set the approval path",
+                       _decide)
+    trace[-1]["output"] = decision
+
+    rec_detail = next((r for r in ranking["ranking"]
+                       if r["strategy"] == ranking["recommended"]), None)
+    fc_source = (ranking["best_detail"] if ranking["recommended"] == ranking["best_detail"]["strategy"]
+                 else se.backtest(bars, ranking["recommended"]))
+    forecast, _ = step("StrategyAgent", "Project the recommended strategy forward",
+                       lambda: se.forecast_path(bars, fc_source, 30))
+
+    out = {
+        "run_id": run_id,
+        "symbol": symbol,
+        "override": ranking.get("override"),
+        "forecast": forecast,
+        "recommended_detail": rec_detail,
+        "data_quality": quality,
+        "regime": ranking["regime"],
+        "recommended": ranking["recommended"],
+        "recommended_label": ranking["recommended_label"],
+        "confidence_pct": ranking["confidence_pct"],
+        "confidence_drivers": ranking["confidence_drivers"],
+        "edge_vs_buy_hold_pp": ranking["edge_vs_buy_hold_pp"],
+        "caveat": ranking["caveat"],
+        "ranking": ranking["ranking"],
+        "best_detail": ranking["best_detail"],
+        "method": ranking["method"],
+        "risk": risk,
+        "decision": decision,
+        "trace": trace,
+        "total_ms": int((time.time() - t_all) * 1000),
+    }
+    _log_audit({"run": run_id, "symbol": symbol, "outcome": "completed",
+                "recommended": out["recommended"], "confidence": out["confidence_pct"],
+                "risk_band": (risk or {}).get("band"),
+                "gate": (risk or {}).get("gate"), "ms": out["total_ms"]})
+    return out
+
+
+@app.route("/api/strategy/<symbol>")
+def api_strategy(symbol):
+    return jsonify(strategy_pipeline(symbol.upper(),
+                                     request.args.get("timeframe", "1Day")))
+
+
+@app.route("/api/strategy/approve", methods=["POST"])
+def api_strategy_approve():
+    """Records a human sign-off. Nothing is executed — this is the audit record
+    that a person reviewed and accepted the recommendation, which is what an
+    approval gate is for."""
+    d = request.get_json(force=True) or {}
+    entry = {
+        "run": d.get("run_id"), "symbol": d.get("symbol"),
+        "strategy": d.get("strategy"), "outcome": "human_approved",
+        "approved_by": d.get("user", "local-operator"),
+        "note": d.get("note", ""),
+    }
+    _log_audit(entry)
+    return jsonify({"recorded": True, "entry": entry,
+                    "meaning": "Logged for audit. No order was placed."})
+
+
+@app.route("/api/backtest/<symbol>/<strategy>")
+def api_backtest(symbol, strategy):
+    bars = get_bars(symbol.upper(), timeframe=request.args.get("timeframe", "1Day"),
+                    limit=500)["bars"]
+    return jsonify(se.backtest(bars, strategy))
+
+
+@app.route("/api/strategies")
+def api_strategies():
+    return jsonify([{"key": k, "label": v["label"], "family": v["family"],
+                     "thesis": v["thesis"], "params": v["params"]}
+                    for k, v in se.STRATEGIES.items()])
+
+
+@app.route("/api/audit")
+def api_audit():
+    with _audit_lock:
+        return jsonify(list(_audit)[-50:][::-1])
 
 
 # --------------------------------------------------------------------------

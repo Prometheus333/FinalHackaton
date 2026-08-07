@@ -96,10 +96,6 @@
       </div>
       <div id="symbolList" class="flex-1 overflow-y-auto space-y-1"></div>
       <div id="divBox" class="mt-2 pt-2 border-t border-[var(--border)] shrink-0 text-[10px]"></div>
-      <div class="collapsible mt-2 pt-2 border-t border-[var(--border)] shrink-0">
-        <h2 class="text-[10px] uppercase tracking-widest text-cyan-300 mb-1 font-bold">Overlays</h2>
-        <div id="overlayList" class="flex flex-wrap gap-1 text-[10px]"></div>
-      </div>
     </section>
 
     <section id="q-chart" class="quad relative panel p-3 flex flex-col overflow-hidden">
@@ -115,6 +111,7 @@
           <button data-tf="1Hour" class="tf-btn px-1.5 py-0.5 border border-[var(--border)] hover:border-emerald-400">1H</button>
           <button data-tf="1Day"  class="tf-btn active px-1.5 py-0.5 border border-[var(--border)] hover:border-emerald-400">1D</button>
           <button data-tf="1Week" class="tf-btn px-1.5 py-0.5 border border-[var(--border)] hover:border-emerald-400">1W</button>
+          <button id="stratBtn" title="Strategy Lab: backtest and recommend" class="px-1.5 py-0.5 border border-violet-800 text-violet-400 hover:border-violet-400 flex items-center"></button>
           <button id="predictBtn" title="AI prediction: buy point, sell point, stop loss" class="px-1.5 py-0.5 border border-cyan-800 text-cyan-400 hover:border-cyan-400 flex items-center"></button>
           <button id="clearBtn" title="Clear chart" class="px-1.5 py-0.5 border border-[var(--border)] text-red-400 hover:border-red-400 flex items-center"></button>
         </div>
@@ -165,6 +162,19 @@
     </section>
 
   </main>
+
+  <div id="stratModal" class="hidden-modal fixed inset-0 z-40 flex items-center justify-center bg-black/75">
+    <div class="panel border border-violet-700 p-4 w-[min(96vw,900px)] max-h-[88vh] overflow-y-auto">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="text-xs uppercase tracking-widest text-violet-400 font-bold">Strategy Lab</h3>
+        <div class="flex items-center gap-2">
+          <span id="stratMs" class="text-[9px] text-gray-600"></span>
+          <button id="stratClose" title="Close" class="text-red-400"></button>
+        </div>
+      </div>
+      <div id="stratBody" class="text-xs"></div>
+    </div>
+  </div>
 
   <div id="predictModal" class="hidden-modal fixed inset-0 z-40 flex items-center justify-center bg-black/70">
     <div class="panel border border-cyan-700 p-4 w-[min(92vw,560px)] max-h-[80vh] overflow-y-auto">
@@ -223,6 +233,7 @@ const ICON = {
   wallet: svg('<path d="M20 12V8H6a2 2 0 0 1 0-4h12v4"/><path d="M4 6v12a2 2 0 0 0 2 2h14v-4"/><circle cx="17" cy="14" r="1.2"/>'),
   collapse: svg('<polyline points="9 4 9 9 4 9"/><polyline points="15 20 15 15 20 15"/><line x1="4" y1="20" x2="9" y2="15"/><line x1="20" y1="4" x2="15" y2="9"/>'),
   pie: svg('<path d="M12 3v9h9"/><circle cx="12" cy="12" r="9"/>'),
+  flask: svg('<path d="M9 3v6L4 19a2 2 0 0 0 2 3h12a2 2 0 0 0 2-3l-5-10V3"/><line x1="8" y1="3" x2="16" y2="3"/><line x1="7" y1="14" x2="17" y2="14"/>'),
 };
 
 /* ===================== STATE ===================== */
@@ -230,7 +241,7 @@ const SESSION_ID = Math.random().toString(36).slice(2);
 let watchlist = ["AAPL","MSFT","SPY","TSLA","NVDA"];
 let names = {};
 let activeSymbol = "AAPL", activeTimeframe = "1Day";
-let overlaySeries = {}, extraSeries = [], candleSeries, chart;
+let extraSeries = [], candleSeries, chart;
 let lastBar = null, quoteCache = {}, es = null, currentNews = [], lastMetrics = null;
 const $ = id => document.getElementById(id);
 setInterval(() => $('clock').textContent = new Date().toUTCString().slice(0,25)+" UTC", 1000);
@@ -349,33 +360,6 @@ function addDashedSeries(points,label,color){
   chip.innerHTML=`<span class="inline-block w-2 h-0.5" style="background:${color}"></span> ${label}`;
   $('legend').appendChild(chip);
 }
-async function addOverlay(symbol){
-  symbol=symbol.toUpperCase();
-  if(overlaySeries[symbol]||symbol===activeSymbol) return;
-  const colors=['#a855f7','#33c9ff','#facc15','#f97316'];
-  const color=colors[Object.keys(overlaySeries).length%colors.length];
-  const d=await (await fetch(`/api/bars/${symbol}?timeframe=${activeTimeframe}&limit=250`)).json();
-  if(!d.bars||!d.bars.length) return;
-  const base=d.bars[0].close;
-  const s=chart.addLineSeries({color,lineWidth:1.5,priceScaleId:'left',lastValueVisible:true});
-  chart.priceScale('left').applyOptions({visible:true,borderColor:'#1e293b'});
-  s.setData(d.bars.map(b=>({time:b.time,value:+(((b.close-base)/base)*100).toFixed(2)})));
-  overlaySeries[symbol]=s; renderOverlayChips();
-}
-function removeOverlay(sym){ if(!overlaySeries[sym])return; chart.removeSeries(overlaySeries[sym]); delete overlaySeries[sym]; renderOverlayChips(); }
-function renderOverlayChips(){
-  const box=$('overlayList'); box.innerHTML='';
-  Object.keys(overlaySeries).forEach(sym=>{
-    const b=document.createElement('button');
-    b.className='px-2 py-0.5 border border-[var(--border)] hover:border-red-400';
-    b.innerHTML=sym+' '+ICON.close; b.className+=' inline-flex items-center gap-0.5';
-    b.title='Remove overlay';
-    b.addEventListener('click', e=>{ e.stopPropagation(); removeOverlay(sym); });
-    box.appendChild(b);
-  });
-}
-
-
 /* ===================== COLLAPSE BUTTONS =====================
    Every panel gets a corner button that appears only while it is enlarged,
    so you can shrink it back without going through the assistant. */
@@ -421,6 +405,171 @@ $('divBox').addEventListener('click', e=>{
   const b = e.target.closest('[data-addsug]');
   if(b) addToWatchlist(b.dataset.addsug);
 });
+
+
+/* ===================== STRATEGY LAB =====================
+   Runs the four-agent pipeline and shows the whole chain: what each agent did,
+   what every strategy scored, and why one was picked. The trace is the point —
+   a recommendation you cannot audit is not usable on a desk. */
+const AGENT_COLOR = {DataAgent:'text-cyan-400', BacktestAgent:'text-violet-400',
+                     RiskAgent:'text-amber-400', StrategyAgent:'text-emerald-400'};
+
+async function runStrategyLab(symbol){
+  const sym = (symbol || activeSymbol).toUpperCase();
+  $('stratBody').innerHTML = '<div class="text-gray-500">Running four agents over real history...</div>';
+  $('stratModal').classList.remove('hidden-modal');
+  const r = await (await fetch(`/api/strategy/${sym}?timeframe=${activeTimeframe}`)).json();
+  $('stratMs').textContent = r.total_ms ? `${r.total_ms} ms` : '';
+
+  const traceHtml = (r.trace||[]).map(t=>`
+    <div class="flex items-start gap-2 py-1 border-b border-[var(--border)]">
+      <span class="${AGENT_COLOR[t.agent]||'text-gray-400'} font-bold w-28 shrink-0">${t.agent}</span>
+      <span class="text-gray-500 flex-1">${t.role}</span>
+      <span class="${t.status==='ok'?'text-emerald-500':'text-red-400'} w-14 text-right">${t.status}</span>
+      <span class="text-gray-600 w-12 text-right tabular-nums">${t.ms}ms</span>
+    </div>`).join('');
+
+  if(r.blocked || r.error){
+    $('stratBody').innerHTML = `
+      <div class="border border-amber-700 bg-amber-950/20 p-3 mb-3">
+        <div class="text-amber-400 font-bold mb-1">Recommendation withheld</div>
+        <div class="text-gray-400">${r.reason || r.error}</div>
+      </div>
+      <div class="text-[9px] uppercase tracking-wider text-gray-600 mb-1">Agent trace</div>${traceHtml}`;
+    return r;
+  }
+
+  const f = r.forecast || {};
+  const rd = r.recommended_detail || {};
+  const up = (f.implied_return_pct ?? 0) >= 0;
+
+  $('stratBody').innerHTML = `
+    <!-- WHAT THIS IS -->
+    <div class="border border-[var(--border)] bg-black/40 p-2 mb-3 text-[10px] text-gray-500 leading-relaxed">
+      Five trading strategies were run over ${rd.trades !== undefined ? r.best_detail.bars : '500'}
+      days of real ${r.symbol} prices from Alpaca (${r.best_detail.period.from} to ${r.best_detail.period.to}).
+      Each one was scored on how much it returned and how much it lost along the way.
+      The winner is the one with the best return for the risk it took.
+    </div>
+
+    <!-- THE ANSWER -->
+    <div class="flex flex-wrap items-baseline gap-3 mb-1">
+      <span class="text-white font-bold text-base">${r.symbol}</span>
+      <span class="text-gray-500 text-[10px]">use</span>
+      <span class="text-violet-300 font-bold text-base">${r.recommended_label}</span>
+      <span class="text-gray-500">confidence ${r.confidence_pct}%</span>
+    </div>
+    <div class="text-gray-500 mb-3 text-[10px]">
+      Market is <span class="text-cyan-400">${r.regime.regime}</span> — ${r.regime.reason}
+    </div>
+
+    ${r.override ? `<div class="border border-amber-800 bg-amber-950/20 p-2 mb-3 leading-snug">
+      <span class="text-amber-400 font-bold">Why not ${r.override.top_ranked_label}?</span>
+      <span class="text-gray-400"> It scored highest in the table below, but ${r.override.why}</span>
+    </div>` : ''}
+    ${r.caveat ? `<div class="border border-amber-800 bg-amber-950/20 p-2 mb-3 text-amber-300 leading-snug">${r.caveat}</div>` : ''}
+
+    <!-- THE PREDICTION -->
+    ${f.median && f.median.length ? `
+    <div class="text-[9px] uppercase tracking-wider text-gray-600 mb-1">Prediction — next ${f.days} trading days</div>
+    <div class="grid grid-cols-4 gap-1 mb-1">
+      <div class="panel-2 px-2 py-2">
+        <div class="text-gray-600 text-[9px]">TODAY</div>
+        <div class="text-gray-200 tabular-nums text-sm">${f.from_price}</div></div>
+      <div class="panel-2 px-2 py-2">
+        <div class="text-gray-600 text-[9px]">EXPECTED</div>
+        <div class="${up?'text-emerald-400':'text-red-400'} tabular-nums text-sm">${f.end_median}</div>
+        <div class="${up?'text-emerald-500':'text-red-500'} text-[9px] tabular-nums">${up?'+':''}${f.implied_return_pct}%</div></div>
+      <div class="panel-2 px-2 py-2">
+        <div class="text-gray-600 text-[9px]">IF IT GOES WELL</div>
+        <div class="text-emerald-400/70 tabular-nums text-sm">${f.end_high}</div></div>
+      <div class="panel-2 px-2 py-2">
+        <div class="text-gray-600 text-[9px]">IF IT GOES BADLY</div>
+        <div class="text-red-400/70 tabular-nums text-sm">${f.end_low}</div></div>
+    </div>
+    <div class="text-[9px] text-gray-600 mb-3 leading-snug">
+      Based on ${f.basis}. Projected forward from today's close — this is what that
+      track record implies, not a promise.
+    </div>
+    <div class="flex gap-2 mb-4">
+      <button id="stratPlot" class="bg-violet-700 hover:bg-violet-600 text-black text-[10px] font-bold px-3 py-1">SHOW ON CHART</button>
+      <button id="stratApprove" title="Records your sign-off in the audit log. Nothing is ordered."
+              class="bg-amber-600 hover:bg-amber-500 text-black text-[10px] font-bold px-3 py-1">SIGN OFF ON THIS</button>
+    </div>` : ''}
+
+    <!-- THE EVIDENCE -->
+    <div class="text-[9px] uppercase tracking-wider text-gray-600 mb-1">What each strategy would have done</div>
+    <table class="w-full mb-1 text-[10px]">
+      <tr class="text-gray-600 text-left">
+        <th>Strategy</th><th title="Average yearly gain over the test period">Yearly gain</th>
+        <th title="Return per unit of risk. Above 1 is good">Return/risk</th>
+        <th title="Worst peak-to-bottom fall you would have sat through">Worst fall</th>
+        <th>Trades</th><th title="Share of trades that made money">Won</th>
+        <th title="Share of days holding a position">Time in market</th><th>Risk</th></tr>
+      ${r.ranking.map(x=>{
+        const isRec = x.strategy === r.recommended;
+        return `<tr class="border-t border-[var(--border)] ${isRec?'bg-violet-950/40':''}">
+        <td class="py-1 ${isRec?'text-violet-300 font-bold':'text-gray-300'}">${isRec?'&#9656; ':''}${x.label}${x.regime_fit?' <span class="text-cyan-500" title="Suits the current market">*</span>':''}</td>
+        <td class="tabular-nums ${x.cagr_pct>=0?'text-emerald-400':'text-red-400'}">${x.cagr_pct}%</td>
+        <td class="tabular-nums">${x.sharpe}</td>
+        <td class="tabular-nums text-red-400/80">-${x.max_drawdown_pct}%</td>
+        <td class="tabular-nums text-gray-500">${x.trades}</td>
+        <td class="tabular-nums text-gray-500">${x.win_rate_pct ?? '-'}${x.win_rate_pct!==null&&x.win_rate_pct!==undefined?'%':''}</td>
+        <td class="tabular-nums text-gray-500">${x.exposure_pct}%</td>
+        <td class="${x.risk_band==='LOW'?'text-emerald-400':x.risk_band==='MODERATE'?'text-amber-400':'text-red-400'}">${x.risk_band}</td></tr>`;
+      }).join('')}
+    </table>
+    <div class="text-[9px] text-gray-600 mb-3 leading-snug">
+      Hover any column heading for what it means. The row marked &#9656; is the recommendation.
+      Yearly gain already includes trading costs and assumes you trade one day after the signal,
+      like a real desk would.
+    </div>
+
+    <!-- WHY -->
+    <div class="grid grid-cols-2 gap-3 mb-3">
+      <div>
+        <div class="text-[9px] uppercase tracking-wider text-gray-600 mb-1">Why confidence is ${r.confidence_pct}%</div>
+        ${r.confidence_drivers.map(d=>`<div class="text-gray-400">· ${d}</div>`).join('')}
+        ${r.edge_vs_buy_hold_pp !== null && r.edge_vs_buy_hold_pp !== undefined
+          ? `<div class="mt-1 ${r.edge_vs_buy_hold_pp>0?'text-emerald-400':'text-red-400'}">
+             ${r.edge_vs_buy_hold_pp>0?'Beats':'Loses to'} simply holding by ${Math.abs(r.edge_vs_buy_hold_pp)} points a year</div>` : ''}
+      </div>
+      <div>
+        <div class="text-[9px] uppercase tracking-wider text-gray-600 mb-1">Risk ${r.risk.band} (${r.risk.score}/100)</div>
+        ${(r.risk.warnings||[]).map(w=>`<div class="text-amber-400/90 leading-snug">! ${w}</div>`).join('') || '<div class="text-gray-500">No warnings raised.</div>'}
+      </div>
+    </div>
+
+    <!-- HOW IT WAS DONE -->
+    <div class="text-[9px] uppercase tracking-wider text-gray-600 mb-1">How this was produced</div>${traceHtml}
+    <div class="text-[9px] text-gray-600 border-t border-[var(--border)] mt-2 pt-2 leading-snug">
+      ${r.best_detail.thesis}<br>
+      Trades execute one day after the signal, ${r.method.cost_bps_per_switch} basis points cost per switch,
+      long or flat only. Backtested results are not a forecast. Paper trading — no orders are placed.
+    </div>`;
+
+  const plot = $('stratPlot');
+  if(plot) plot.onclick = ()=>{
+    clearExtraSeries();
+    addDashedSeries(f.median, `${r.recommended_label} — expected`, '#a855f7');
+    addDashedSeries(f.high,   'Upper band', '#3f6212');
+    addDashedSeries(f.low,    'Lower band', '#7f1d1d');
+    $('stratModal').classList.add('hidden-modal');
+    focusPanel('chart');
+  };
+  const appr = $('stratApprove');
+  if(appr) appr.onclick = async ()=>{
+    await fetch('/api/strategy/approve',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({run_id:r.run_id, symbol:r.symbol, strategy:r.recommended})});
+    logSystem(`Signed off: ${r.recommended_label} on ${r.symbol}. Logged for audit — no order placed.`);
+    appr.textContent = 'SIGNED OFF'; appr.disabled = true;
+    appr.className = 'bg-emerald-700 text-black text-[10px] font-bold px-3 py-1';
+  };
+  return r;
+}
+$('stratBtn').onclick = () => runStrategyLab();
+$('stratClose').onclick = () => $('stratModal').classList.add('hidden-modal');
 
 /* ===================== AI PREDICTION ===================== */
 const ACTION_STYLE = {BUY:['text-emerald-400','border-emerald-700'],
@@ -520,12 +669,12 @@ $('simRun').onclick = () => runSimulation();
 $('simClose').onclick = () => $('simModal').classList.add('hidden-modal');
 
 // Click on the backdrop or press Escape closes any modal.
-['predictModal','simModal'].forEach(id=>{
+['predictModal','simModal','stratModal'].forEach(id=>{
   $(id).addEventListener('click', e=>{ if(e.target.id === id) $(id).classList.add('hidden-modal'); });
 });
 document.addEventListener('keydown', e=>{
   if(e.key !== 'Escape') return;
-  ['predictModal','simModal','newsModal'].forEach(id=>$(id).classList.add('hidden-modal'));
+  ['predictModal','simModal','stratModal','newsModal'].forEach(id=>$(id).classList.add('hidden-modal'));
 });
 
 /* ===================== PROACTIVE DESK =====================
@@ -902,8 +1051,6 @@ function applyCommand(cmd){
   switch(cmd.action){
     case 'add_projection': addDashedSeries(cmd.points,cmd.label,'#33c9ff'); focusPanel('chart'); break;
     case 'add_scenario':   addDashedSeries(cmd.points,cmd.label,'#ff9900'); focusPanel('chart'); break;
-    case 'add_overlay':    addOverlay(cmd.symbol); break;
-    case 'remove_overlay': removeOverlay(cmd.symbol); break;
     case 'set_symbol':     loadSymbol(cmd.symbol); break;
     case 'filter_news':    refreshNews({symbol:activeSymbol, keywords:cmd.keywords}); break;
     case 'clear_projections': clearExtraSeries(); break;
@@ -940,8 +1087,7 @@ $('chatForm').addEventListener('submit', async e=>{
   }catch(err){ thinking.textContent='Connection error - check the logs.'; }
 });
 
-$('clearBtn').addEventListener('click',()=>{ clearExtraSeries(); clearAllIndicators();
-  Object.keys(overlaySeries).forEach(removeOverlay); focusPanel('balanced'); });
+$('clearBtn').addEventListener('click',()=>{ clearExtraSeries(); clearAllIndicators(); focusPanel('balanced'); });
 document.querySelectorAll('.tf-btn').forEach(b=>b.addEventListener('click',()=>loadSymbol(activeSymbol,b.dataset.tf)));
 
 /* ===================== PROJECTIONS ===================== */
@@ -994,10 +1140,7 @@ const clientTools = {
       sma20:m.sma20, sma50:m.sma50, changes:m.change_pct, range_52w:m.range_52w});
   },
   run_projection: async (p) => JSON.stringify(await drawProjection(p||{})),
-  compare_symbol: async ({symbol}) => { await addOverlay(symbol); focusPanel('chart');
-    return `${symbol} overlaid on a base-100 scale against ${activeSymbol}.`; },
-  clear_chart: async () => { clearExtraSeries(); Object.keys(overlaySeries).forEach(removeOverlay);
-    return 'Chart cleared.'; },
+  clear_chart: async () => { clearExtraSeries(); clearAllIndicators(); return 'Chart cleared.'; },
   set_timeframe: async ({timeframe}) => { await loadSymbol(activeSymbol, timeframe);
     return `Timeframe set to ${timeframe}.`; },
 
@@ -1007,6 +1150,15 @@ const clientTools = {
   open_news:  async ({index}) => JSON.stringify(await openNews(parseInt(index,10))),
   close_news: async () => { $('newsModal').classList.add('hidden-modal'); return 'Closed.'; },
 
+  run_strategy_lab: async ({symbol}) => {
+    const r = await runStrategyLab(symbol);
+    if(r.blocked || r.error) return r.reason || r.error;
+    return JSON.stringify({symbol:r.symbol, regime:r.regime.regime,
+      recommended:r.recommended_label, confidence_pct:r.confidence_pct,
+      edge_vs_buy_hold_pp:r.edge_vs_buy_hold_pp, risk_band:r.risk.band,
+      gate:r.risk.gate, caveat:r.caveat,
+      top3:r.ranking.slice(0,3).map(x=>`${x.label}: CAGR ${x.cagr_pct}%, Sharpe ${x.sharpe}, DD ${x.max_drawdown_pct}%`)});
+  },
   ai_prediction: async ({symbol}) => {
     const r = await showPrediction(symbol);
     return JSON.stringify({action:r.action, symbol:r.symbol, price:r.price,
@@ -1356,6 +1508,8 @@ $('voiceBtn').addEventListener('click', ()=>{
 /* ===================== BOOT ===================== */
 renderToolbar();
 mountCollapseButtons();
+$('stratBtn').innerHTML = ICON.flask;
+$('stratClose').innerHTML = ICON.close;
 $('predictBtn').innerHTML = ICON.brain;
 $('simBtn').innerHTML     = ICON.wallet;
 $('predictClose').innerHTML = ICON.close;

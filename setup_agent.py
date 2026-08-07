@@ -125,10 +125,6 @@ TOOLS = [
          "shock_pct": n("Initial shock in percent, e.g. -8 to simulate a bad earnings report. Zero if not applicable"),
      })),
 
-    ("compare_symbol",
-     "Overlays another instrument on the chart on a base-100 scale to compare relative performance.",
-     p({"symbol": s("Ticker to overlay")}, ["symbol"])),
-
     ("clear_chart",
      "Clears all projections and overlays from the chart.",
      p()),
@@ -156,6 +152,10 @@ TOOLS = [
      p({"panel": {"type": "string", "enum": ["balanced", "watchlist", "chart", "chat", "news"],
                   "description": "Panel to focus. 'balanced' returns all four to equal size"}},
        ["panel"])),
+
+    ("run_strategy_lab",
+     "Runs the full four-agent pipeline on a symbol: fetches history, backtests every trading strategy, scores risk and recommends one, with a confidence figure and an approval gate. Use this whenever the operator asks which strategy to use, how a strategy has performed, or what the backtest says.",
+     p({"symbol": s("Ticker. If omitted, uses the active symbol")})),
 
     ("ai_prediction",
      "Opens the AI prediction panel for a symbol and returns an explicit BUY, SELL or HOLD call with a buy point, a sell point and a stop loss, all sized from real volatility. Returns HOLD with a reason when the signals do not justify a trade.",
@@ -211,6 +211,10 @@ Not every message is a market question.
 - Greeting or small talk ("hi", "how's it going", "thanks"): answer like a person. One warm line, NO numbers, NO ticker. Then offer one concrete thing you could do. Example: "Morning. Want me to scan the watchlist and tell you what's moved?"
 - Vague or open ("what's up", "anything interesting"): do NOT default to the active symbol. Call scan_watchlist and lead with the single most notable thing.
 - Named symbol or explicit market question: give the read, with numbers.
+
+## Strategies are the core of your job
+When the operator asks what strategy to run, how something has performed, or whether an approach works, call run_strategy_lab. Report the recommended strategy, its CAGR and Sharpe, the max drawdown, and the confidence. Always say whether it beat buy-and-hold: if it did not, say so plainly and recommend holding.
+If the gate comes back as review_required, tell them it needs their sign-off and why. Never describe a backtest as a prediction — say "over this history" or "backtested", never "will return".
 
 ## Calls, levels and money
 When the operator asks whether to buy something, use ai_prediction — never improvise levels. Read out the action, the buy point, the stop loss and the risk-reward. If it comes back HOLD, say HOLD and give the reason: no trade is a valid answer and pretending otherwise is how people lose money.
