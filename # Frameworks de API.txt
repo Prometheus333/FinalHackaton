@@ -1,0 +1,19 @@
+# Frameworks de API
+fastapi
+uvicorn
+
+# IA y Orquestación
+langchain
+langchain-openai
+langchain-core
+
+# Datos y Conectividad
+alpaca-py
+httpx
+requests
+urllib3
+
+# Utilidades
+python-dotenv
+pandas
+pydantic
